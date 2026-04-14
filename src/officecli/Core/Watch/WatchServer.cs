@@ -1688,7 +1688,8 @@ internal class WatchServer : IDisposable
             var path = root.GetProperty("path").GetString() ?? "";
 
             // Spawn officecli set as child process
-            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "officecli";
+            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
+                ?? (OperatingSystem.IsWindows() ? "officecli.exe" : "officecli");
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = exe,
