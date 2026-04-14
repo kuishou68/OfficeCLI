@@ -659,16 +659,36 @@ public partial class WordHandler
             _themeCjkFont = eaFont;
     }
 
-    /// <summary>Generate @font-face rules with local() for document fonts.</summary>
+    /// <summary>
+    /// Generate @font-face rules with local() for document fonts, including
+    /// ascent-override / descent-override / line-gap-override descriptors.
+    ///
+    /// Why the overrides: CSS's default line-height model distributes leading
+    /// via the font's sTypoAscender/Descender + sTypoLineGap (or hhea metrics,
+    /// depending on fsSelection USE_TYPO_METRICS), which is NOT what Word uses.
+    /// Word uses usWinAscent/usWinDescent and no line-gap. For CJK fonts in
+    /// particular, typo metrics tend to be tight while winMetrics leave proper
+    /// breathing room for glyphs — which is why a docx rendered faithfully
+    /// (line-height: 1.15) looks cramped in the browser but correct in Word.
+    ///
+    /// By emitting ascent/descent overrides based on OS/2 usWinAscent/usWinDescent,
+    /// CSS line-height: X now produces Word-equivalent line boxes at the same
+    /// multiplier value. No per-document line-height floor needed — Word's
+    /// original values are preserved and render correctly.
+    /// </summary>
     private static string ResolveLocalFontFaces(HashSet<string> docFonts)
     {
         var sb = new StringBuilder();
         foreach (var font in docFonts)
         {
-            sb.AppendLine($"@font-face {{ font-family: '{font}'; src: local('{font}'); }}");
-            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-weight: bold; src: local('{font} Bold'); }}");
-            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-style: italic; src: local('{font} Italic'); }}");
-            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-weight: bold; font-style: italic; src: local('{font} Bold Italic'); }}");
+            var (ascPct, descPct) = FontMetricsReader.GetAscentDescentOverride(font);
+            var overrides = (ascPct > 0 && descPct > 0)
+                ? $" ascent-override: {ascPct:0.##}%; descent-override: {descPct:0.##}%; line-gap-override: 0%;"
+                : "";
+            sb.AppendLine($"@font-face {{ font-family: '{font}'; src: local('{font}');{overrides} }}");
+            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-weight: bold; src: local('{font} Bold');{overrides} }}");
+            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-style: italic; src: local('{font} Italic');{overrides} }}");
+            sb.AppendLine($"@font-face {{ font-family: '{font}'; font-weight: bold; font-style: italic; src: local('{font} Bold Italic');{overrides} }}");
         }
         return sb.ToString();
     }

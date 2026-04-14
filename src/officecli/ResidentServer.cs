@@ -12,7 +12,32 @@ namespace OfficeCli;
 
 public class ResidentServer : IDisposable
 {
-    private readonly IDocumentHandler _handler;
+    // Non-readonly: when _lazyOpen is true, this field is populated per-command
+    // inside ExecuteCommand and reset to null when the command finishes, so the
+    // underlying file handle (and its advisory flock) is only held while work is
+    // actually in flight. Outside command execution the resident holds no file.
+    // In non-lazy mode (default), this is set once in the constructor.
+    // Invariant: non-null whenever an Execute* helper runs. Enforced by the
+    // dispatch wrapper in ExecuteCommand.
+    private IDocumentHandler _handler = null!;
+    /// <summary>
+    /// When true, the resident does NOT keep the document open between commands.
+    /// Each command opens the file, runs, then disposes the handler. Controlled
+    /// by the `OFFICECLI_NO_PERSISTENT_LOCK` env var (values "1" or "true").
+    ///
+    /// Use case: hosts like desktop apps that want the resident's IPC / cache
+    /// benefits but need the underlying file to stay unlocked so external apps
+    /// (Word, WPS, Finder preview) can open it while the resident is idle.
+    ///
+    /// Tradeoff: adds ~50-150ms zip-reparse cost per command, in exchange for
+    /// losing the 60s–12min "file-is-locked-while-resident-is-alive" window.
+    /// </summary>
+    private readonly bool _lazyOpen;
+    /// <summary>
+    /// Constructor arg cached for the lazy-open path. In non-lazy mode this is
+    /// applied once at startup and then unused.
+    /// </summary>
+    private readonly bool _editable;
     private readonly string _filePath;
     private readonly string _pipeName;
     // Shutdown uses TWO independent CTSs so the ping pipe can outlive the
@@ -93,7 +118,16 @@ public class ResidentServer : IDisposable
     {
         _filePath = Path.GetFullPath(filePath);
         _pipeName = GetPipeName(_filePath);
-        _handler = DocumentHandlerFactory.Open(_filePath, editable);
+        _editable = editable;
+        var envNoLock = Environment.GetEnvironmentVariable("OFFICECLI_NO_PERSISTENT_LOCK");
+        _lazyOpen = envNoLock == "1"
+            || string.Equals(envNoLock, "true", StringComparison.OrdinalIgnoreCase);
+        if (!_lazyOpen)
+        {
+            // Default: open once, hold for the lifetime of the resident.
+            _handler = DocumentHandlerFactory.Open(_filePath, editable);
+        }
+        // In lazy mode, _handler stays null until ExecuteCommand opens it per-request.
     }
 
     public static string GetPipeName(string filePath)
@@ -527,6 +561,36 @@ public class ResidentServer : IDisposable
 
     private void ExecuteCommand(ResidentRequest request)
     {
+        if (_lazyOpen)
+        {
+            // Per-command handler lifecycle: open → run → dispose. The file's
+            // advisory flock is only held for the duration of this call, which
+            // is typically <500ms. External apps (Word, WPS, Finder preview)
+            // can open the file during the idle window between commands.
+            //
+            // Note: we always open editable=true here because the command may
+            // mutate (set/add/remove). A future optimization could classify
+            // the command and open editable=false for pure-read commands
+            // (view/get/query/check/validate), yielding a shared read lock
+            // that lets multiple readers coexist.
+            using var h = DocumentHandlerFactory.Open(_filePath, editable: true);
+            _handler = h;
+            try
+            {
+                ExecuteCommandCore(request);
+            }
+            finally
+            {
+                _handler = null!;
+            }
+            return;
+        }
+
+        ExecuteCommandCore(request);
+    }
+
+    private void ExecuteCommandCore(ResidentRequest request)
+    {
         var format = request.Json ? OutputFormat.Json : OutputFormat.Text;
 
         switch (request.Command)
@@ -757,12 +821,10 @@ public class ResidentServer : IDisposable
 
             if (html != null)
             {
-                if (req.Json)
+                var browser = req.GetArgOrNull("browser") == "true";
+                if (browser)
                 {
-                    Console.Write(html);
-                }
-                else
-                {
+                    // --browser: write to temp file and open in browser (matches non-resident behavior)
                     var htmlPath = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}.html");
                     File.WriteAllText(htmlPath, html);
                     Console.WriteLine(htmlPath);
@@ -772,6 +834,11 @@ public class ResidentServer : IDisposable
                         System.Diagnostics.Process.Start(psi);
                     }
                     catch { /* silently ignore if browser can't be opened */ }
+                }
+                else
+                {
+                    // Default: output HTML to stdout (matches non-resident behavior)
+                    Console.Write(html);
                 }
             }
             else
@@ -1169,10 +1236,17 @@ public class ResidentServer : IDisposable
         //    disk and closes the file handle). The ping pipe is still
         //    live right now, so any TryResident caller will correctly
         //    conclude "resident still owns the file".
-        try { _handler.Dispose(); }
-        catch (Exception ex)
+        //
+        // In lazy-open mode (_lazyOpen == true) there is no persistent
+        // handler to dispose: every command has already opened-and-closed
+        // its own. _handler is null here and there's nothing to do.
+        if (_handler != null)
         {
-            Console.Error.WriteLine($"Warning: handler dispose error: {ex.Message}");
+            try { _handler.Dispose(); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Warning: handler dispose error: {ex.Message}");
+            }
         }
 
         // 5. NOW cancel ping + idle. Clients observing the ping pipe from
