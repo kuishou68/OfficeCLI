@@ -1229,6 +1229,19 @@ internal class WatchServer : IDisposable
 
     // ==================== Excel Row-Level Diff ====================
 
+    /// <summary>
+    /// Signature of chart overlay positions — concatenation of all data-from-row/col
+    /// values in document order. Different signature → chart was moved → need full refresh.
+    /// </summary>
+    private static string ChartOverlaySignature(string html)
+    {
+        var sb = new System.Text.StringBuilder();
+        var rx = new System.Text.RegularExpressions.Regex(@"data-from-(?:row|col)=""(\d+)""");
+        foreach (System.Text.RegularExpressions.Match m in rx.Matches(html))
+            sb.Append(m.Value).Append(',');
+        return sb.ToString();
+    }
+
     /// <summary>Split Excel HTML into rows keyed by "sheetIdx-rowNum" from data-row attributes.</summary>
     private static Dictionary<string, string> SplitExcelRows(string html)
     {
@@ -1254,6 +1267,12 @@ internal class WatchServer : IDisposable
         if (string.IsNullOrEmpty(oldHtml) || string.IsNullOrEmpty(newHtml))
             return null;
         if (!oldHtml.Contains("data-row=\"") || !newHtml.Contains("data-row=\""))
+            return null;
+
+        // If chart overlay positions changed, fall back to full refresh.
+        // excel-patch only patches <tr> rows; overlay divs are outside the table
+        // and won't be updated by row-level patching.
+        if (ChartOverlaySignature(oldHtml) != ChartOverlaySignature(newHtml))
             return null;
 
         var oldRows = SplitExcelRows(oldHtml);
@@ -1416,6 +1435,13 @@ internal class WatchServer : IDisposable
             if (requestLine.StartsWith("POST /api/selection", StringComparison.Ordinal))
             {
                 await HandlePostSelectionAsync(stream, headers, bodyPrefix, token);
+                client.Close();
+                return;
+            }
+
+            if (requestLine.StartsWith("POST /api/edit", StringComparison.Ordinal))
+            {
+                await HandlePostEditAsync(stream, headers, bodyPrefix, token);
                 client.Close();
                 return;
             }
@@ -1615,6 +1641,91 @@ internal class WatchServer : IDisposable
             statusText = "Bad Request";
         }
 
+        var resp = Encoding.UTF8.GetBytes(
+            $"HTTP/1.1 {statusCode} {statusText}\r\nContent-Length: 0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+        await stream.WriteAsync(resp, token);
+    }
+
+    /// <summary>
+    /// Handle POST /api/edit — spawn officecli set as a child process to modify the file.
+    /// The set command will notify the watch server via named pipe, triggering an SSE refresh.
+    /// WatchServer never opens the file directly (see CLAUDE.md "Watch Server Rules").
+    /// </summary>
+    private async Task HandlePostEditAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
+    {
+        int statusCode = 204;
+        string statusText = "No Content";
+        try
+        {
+            // Read body (same pattern as selection handler)
+            int contentLength = 0;
+            if (headers.TryGetValue("Content-Length", out var clStr) && int.TryParse(clStr, out var cl))
+                contentLength = cl;
+            if (contentLength > MaxSelectionBodyBytes) throw new InvalidDataException("body too large");
+
+            var body = bodyPrefix;
+            if (contentLength > body.Length)
+            {
+                var sb = new StringBuilder(body);
+                var buf = new byte[4096];
+                int have = Encoding.UTF8.GetByteCount(body);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(PostBodyReadTimeout);
+                while (have < contentLength)
+                {
+                    var n = await stream.ReadAsync(buf, cts.Token);
+                    if (n == 0) break;
+                    sb.Append(Encoding.UTF8.GetString(buf, 0, n));
+                    have += n;
+                }
+                body = sb.ToString();
+            }
+
+            // Parse: {"path": "...", "prop": "text", "value": "Hello"}
+            // or:    {"path": "...", "props": {"x": "10pt", "y": "20pt"}}
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            var path = root.GetProperty("path").GetString() ?? "";
+
+            // Spawn officecli set as child process
+            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "officecli";
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = exe,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("set");
+            psi.ArgumentList.Add(_filePath);
+            psi.ArgumentList.Add(path);
+            if (root.TryGetProperty("props", out var propsEl) && propsEl.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                foreach (var kv in propsEl.EnumerateObject())
+                {
+                    psi.ArgumentList.Add("--prop");
+                    psi.ArgumentList.Add($"{kv.Name}={kv.Value.GetString() ?? ""}");
+                }
+            }
+            else
+            {
+                var prop = root.GetProperty("prop").GetString() ?? "text";
+                var value = root.GetProperty("value").GetString() ?? "";
+                psi.ArgumentList.Add("--prop");
+                psi.ArgumentList.Add($"{prop}={value}");
+            }
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc != null)
+            {
+                await proc.WaitForExitAsync(token);
+                // set command auto-notifies watch via named pipe → SSE refresh
+            }
+        }
+        catch
+        {
+            statusCode = 400; statusText = "Bad Request";
+        }
         var resp = Encoding.UTF8.GetBytes(
             $"HTTP/1.1 {statusCode} {statusText}\r\nContent-Length: 0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
         await stream.WriteAsync(resp, token);

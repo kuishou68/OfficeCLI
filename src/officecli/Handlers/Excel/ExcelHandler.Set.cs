@@ -1186,10 +1186,28 @@ public partial class ExcelHandler
     private List<string> SetCellProperties(Cell cell, string cellRef, WorksheetPart worksheet, Dictionary<string, string> properties)
     {
         var unsupported = ApplyCellProperties(cell, cellRef, worksheet, properties);
+        // Remove completely empty cells (no value, no formula, no custom style) so that
+        // rows with no remaining cells are pruned from XML. This keeps maxRow correct
+        // and produces "remove" watch patches instead of "replace" for cleared rows.
+        PruneEmptyCell(cell);
         // Any mutation to a cell (value, formula, clear) can invalidate the calc chain
         DeleteCalcChainIfPresent();
         SaveWorksheet(worksheet);
         return unsupported;
+    }
+
+    private static void PruneEmptyCell(Cell cell)
+    {
+        var hasValue = cell.CellValue != null && !string.IsNullOrEmpty(cell.CellValue.Text);
+        var hasFormula = cell.CellFormula != null;
+        var hasStyle = cell.StyleIndex != null && cell.StyleIndex.Value != 0;
+        if (!hasValue && !hasFormula && !hasStyle)
+        {
+            var row = cell.Parent as Row;
+            cell.Remove();
+            if (row != null && !row.Elements<Cell>().Any())
+                row.Remove();
+        }
     }
 
     /// <summary>Apply cell properties without saving — caller is responsible for SaveWorksheet.</summary>
@@ -1214,6 +1232,9 @@ public partial class ExcelHandler
             switch (key.ToLowerInvariant())
             {
                 case "value" or "text":
+                    // Auto-detect formula: value starting with '=' is treated as formula
+                    if (value.StartsWith('=') && value.Length > 1)
+                        goto case "formula";
                     var cellValue = value.Replace("\\n", "\n"); // Support escaped newlines
                     cell.CellFormula = null; // Clear formula when explicit value is set
                     // If cell is already boolean type, convert true/false to 1/0

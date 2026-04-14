@@ -30,7 +30,7 @@ public partial class ExcelHandler
     /// Pre-render all charts and return them with their anchor row/col positions.
     /// Charts with overlapping row ranges are grouped into flex rows.
     /// </summary>
-    private List<(int fromRow, int toRow, int fromCol, int toCol, string html)> CollectSheetCharts(WorksheetPart worksheetPart)
+    private List<(int fromRow, int toRow, int fromCol, int toCol, string html)> CollectSheetCharts(WorksheetPart worksheetPart, string sheetName = "")
     {
         var result = new List<(int fromRow, int toRow, int fromCol, int toCol, string html)>();
         var drawingsPart = worksheetPart.DrawingsPart;
@@ -42,6 +42,10 @@ public partial class ExcelHandler
             .ToList();
 
         if (chartFrames.Count == 0) return result;
+
+        // Build GF → 1-based chart index map (document order, same as GetExcelCharts)
+        var gfIndexMap = new Dictionary<XDR.GraphicFrame, int>();
+        for (int i = 0; i < chartFrames.Count; i++) gfIndexMap[chartFrames[i]] = i + 1;
 
         var chartAnchors = chartFrames.Select(gf =>
         {
@@ -57,59 +61,26 @@ public partial class ExcelHandler
             return (gf, fromRow, toRow, fromCol, toCol);
         }).OrderBy(x => x.fromRow).ThenBy(x => x.fromCol).ToList();
 
-        // Group into rows: charts whose row ranges overlap go in the same flex row
-        var groups = new List<(int fromRow, int toRow, int minFromCol, int maxToCol, List<XDR.GraphicFrame> frames)>();
-        int currentRowEnd = -1;
-        List<XDR.GraphicFrame>? currentGroup = null;
-        int currentMinFromCol = 0, currentMaxToCol = 0;
+        // Each chart gets its own overlay (no flex grouping) so drag-to-move works independently
         foreach (var (gf, fromRow, toRow, fromCol, toCol) in chartAnchors)
         {
-            if (currentGroup == null || fromRow >= currentRowEnd)
-            {
-                currentGroup = new List<XDR.GraphicFrame>();
-                currentMinFromCol = fromCol;
-                currentMaxToCol = toCol;
-                currentRowEnd = toRow;
-                groups.Add((fromRow, toRow, fromCol, toCol, currentGroup));
-            }
-            else
-            {
-                currentRowEnd = Math.Max(currentRowEnd, toRow);
-                currentMinFromCol = Math.Min(currentMinFromCol, fromCol);
-                currentMaxToCol = Math.Max(currentMaxToCol, toCol);
-                groups[^1] = (groups[^1].fromRow, currentRowEnd, currentMinFromCol, currentMaxToCol, currentGroup);
-            }
-            currentGroup.Add(gf);
-        }
-
-        foreach (var (fromRow, toRow, minFromCol, maxToCol, frames) in groups)
-        {
             var chartSb = new StringBuilder();
-            if (frames.Count > 1)
-            {
-                chartSb.AppendLine("<div style=\"display:flex;gap:16px;flex-wrap:wrap\">");
-                foreach (var gf in frames)
-                    RenderExcelChart(chartSb, gf, drawingsPart, worksheetPart);
-                chartSb.AppendLine("</div>");
-            }
-            else
-            {
-                RenderExcelChart(chartSb, frames[0], drawingsPart, worksheetPart);
-            }
-            result.Add((fromRow, toRow, minFromCol, maxToCol, chartSb.ToString()));
+            RenderExcelChart(chartSb, gf, drawingsPart, worksheetPart, sheetName, gfIndexMap.GetValueOrDefault(gf));
+            result.Add((fromRow, toRow, fromCol, toCol, chartSb.ToString()));
         }
 
         return result;
     }
 
     private void RenderExcelChart(StringBuilder sb, XDR.GraphicFrame gf,
-        DrawingsPart drawingsPart, WorksheetPart worksheetPart)
+        DrawingsPart drawingsPart, WorksheetPart worksheetPart,
+        string sheetName = "", int chartIdx = 0)
     {
         // cx:chart (extended) path — histogram / funnel / treemap / sunburst /
         // boxWhisker. Delegate to the cx-aware extractor and shared renderer.
         if (IsExtendedChartFrame(gf))
         {
-            RenderExcelCxChart(sb, gf, drawingsPart, worksheetPart);
+            RenderExcelCxChart(sb, gf, drawingsPart, worksheetPart, sheetName, chartIdx);
             return;
         }
 
@@ -215,7 +186,8 @@ public partial class ExcelHandler
 
         var bgStyle = info.ChartFillColor != null ? $"background:#{info.ChartFillColor};" : "";
         // Use estimated width as max-width, but allow stretching to fill parent (e.g. colspan td)
-        sb.AppendLine($"<div class=\"chart-container\" style=\"max-width:max({svgW}pt,100%);flex:1;min-width:200pt;{bgStyle}\">");
+        var chartDataPath = chartIdx > 0 && !string.IsNullOrEmpty(sheetName) ? $" data-path=\"/{HtmlEncode(sheetName)}/chart[{chartIdx}]\"" : "";
+        sb.AppendLine($"<div class=\"chart-container\"{chartDataPath} style=\"max-width:max({svgW}pt,100%);flex:1;min-width:200pt;{bgStyle}\">");
 
         var titleColor = info.TitleFontColor ?? "#333";
         if (!string.IsNullOrEmpty(info.Title))
@@ -445,7 +417,8 @@ public partial class ExcelHandler
     /// with theme colors, and emit the SVG + legend inside a chart-container div.
     /// </summary>
     private void RenderExcelCxChart(StringBuilder sb, XDR.GraphicFrame gf,
-        DrawingsPart drawingsPart, WorksheetPart worksheetPart)
+        DrawingsPart drawingsPart, WorksheetPart worksheetPart,
+        string sheetName = "", int chartIdx = 0)
     {
         var relId = GetExtendedChartRelId(gf);
         if (relId == null) return;
@@ -488,7 +461,8 @@ public partial class ExcelHandler
         var chartSvgH = svgH - titleH;
         if (chartSvgH < 80) return;
 
-        sb.AppendLine($"<div class=\"chart-container\" style=\"max-width:max({svgW}pt,100%);flex:1;min-width:200pt\">");
+        var cxChartDataPath = chartIdx > 0 && !string.IsNullOrEmpty(sheetName) ? $" data-path=\"/{HtmlEncode(sheetName)}/chart[{chartIdx}]\"" : "";
+        sb.AppendLine($"<div class=\"chart-container\"{cxChartDataPath} style=\"max-width:max({svgW}pt,100%);flex:1;min-width:200pt\">");
 
         var titleColor = info.TitleFontColor ?? "#333";
         if (!string.IsNullOrEmpty(info.Title))

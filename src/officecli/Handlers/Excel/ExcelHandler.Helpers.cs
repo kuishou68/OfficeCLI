@@ -538,10 +538,10 @@ public partial class ExcelHandler
                         if (fonts != null && fontId < (uint)fonts.Elements<Font>().Count())
                         {
                             var font = fonts.Elements<Font>().ElementAt((int)fontId);
-                            if (font.Bold != null) { node.Format["bold"] = true; }
+                            if (font.Bold != null) { node.Format["font.bold"] = true; }
                             if (font.Italic != null)
                             {
-                                node.Format["italic"] = true;
+                                node.Format["font.italic"] = true;
                             }
                             if (font.Strike != null) node.Format["font.strike"] = true;
                             if (font.Underline != null)

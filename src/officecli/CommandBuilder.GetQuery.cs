@@ -117,14 +117,25 @@ static partial class CommandBuilder
             }
         }
 
+        // Flatten row/column nodes into their children so text output is
+        // grep-friendly (one cell per line instead of a single "/Sheet1/col[C]" line).
+        var flat = new List<OfficeCli.Core.DocumentNode>();
+        foreach (var n in nodes)
+        {
+            if (n.Children.Count > 0 && n.Type is "column" or "row")
+                flat.AddRange(n.Children);
+            else
+                flat.Add(n);
+        }
+
         if (json)
         {
             Console.WriteLine(OutputFormatter.WrapEnvelope(
-                OutputFormatter.FormatNodes(nodes, OutputFormat.Json)));
+                OutputFormatter.FormatNodes(flat, OutputFormat.Json)));
         }
         else
         {
-            Console.WriteLine(OutputFormatter.FormatNodes(nodes, OutputFormat.Text));
+            Console.WriteLine(OutputFormatter.FormatNodes(flat, OutputFormat.Text));
         }
         return 0;
     }

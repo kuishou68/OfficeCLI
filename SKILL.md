@@ -56,15 +56,14 @@ Replace `pptx` with `docx` or `xlsx`. Commands: `view`, `get`, `query`, `set`, `
 
 ## Performance: Resident Mode
 
-For multi-step workflows (3+ commands on the same file), use `create`/`open` + `close`:
+**Every command auto-starts a resident on first access** (60s idle timeout) — file-lock conflicts are automatically avoided. Explicit `open`/`close` is still recommended for longer sessions (12min idle):
 ```bash
-officecli create report.docx     # create blank file and keep in memory
-officecli open report.docx       # or open existing file and keep in memory
+officecli open report.docx       # explicitly keep in memory
 officecli set report.docx ...    # no file I/O overhead
 officecli close report.docx      # save and release
 ```
 
-Skipping `close` still works (the resident exits on its own after 60s idle for `create`, 12min for `open`), but explicit `close` releases the file immediately and guarantees the save is flushed before the next command sees the file on disk.
+Opt out of auto-start: `OFFICECLI_NO_AUTO_RESIDENT=1`. Skipping `close` still works (resident exits on idle), but explicit `close` guarantees the file is flushed before the next command reads it.
 
 ---
 
@@ -123,7 +122,7 @@ officecli view report.docx html --browser             # open in default browser
 
 ### get
 
-Any XML path via element localName. Use `--depth N` to expand children. Add `--json` for structured output.
+Any XML path via element localName. Use `--depth N` to expand children. Add `--json` for structured output. Default text output is grep-friendly single-line per node: `path (type) "text" key=val key=val ...`
 
 ```bash
 officecli get report.docx '/body/p[3]' --depth 2 --json
@@ -175,7 +174,7 @@ officecli watch <file> [--port N]      # Start preview server (default port 1808
 officecli unwatch <file>               # Stop the preview server
 ```
 
-Open the printed `http://localhost:N` URL in a browser. Click any shape to select (blue outline highlight); shift/cmd/ctrl+click to multi-select; drag from empty space to box-select (rubber-band).
+Open the printed `http://localhost:N` URL in a browser. Click any element to select; shift/cmd/ctrl+click to multi-select; drag from empty space to box-select (rubber-band). PPT/Word uses blue outline; Excel uses native-style green selection with crosshair and rectangular range selection. **Excel extras:** double-click a cell to edit inline (shows formula, commits on Enter/Tab); drag a chart to reposition it.
 
 ### `get <file> selected` — read what the user clicked
 
@@ -325,7 +324,7 @@ officecli add <file> <parent> --from <path>                               # clon
 |--------|-------|
 | **pptx** | slide, shape (textbox), picture (image/img), chart, table, row (tr), connector (connection/line), group, video (audio/media), equation (formula/math), notes, paragraph (para), run, zoom (slidezoom), ole (oleobject/object/embed) |
 | **docx** | paragraph (para), run, table, row (tr), cell (td), image (picture/img), header, footer, section, bookmark, comment, footnote, endnote, formfield (text/checkbox/dropdown), sdt (contentcontrol), chart, equation (formula/math), field, hyperlink, style, toc, watermark, break (pagebreak/columnbreak), ole (oleobject/object/embed). Document protection: `set / --prop protection=forms\|readOnly\|comments\|trackedChanges\|none` |
-| **xlsx** | sheet, row, cell, chart, image (picture), comment, table (listobject), namedrange (definedname), pivottable (pivot), sparkline, validation (datavalidation), autofilter, shape, textbox, databar/colorscale/iconset/formulacf (conditional formatting), ole (oleobject/object/embed — no Remove yet), csv (tsv). Formulas auto-evaluated on write (150+ functions including VLOOKUP, SUMIF, IF, DATE, PMT, etc.) |
+| **xlsx** | sheet, row, cell, chart, image (picture), comment, table (listobject), namedrange (definedname), pivottable (pivot), sparkline, validation (datavalidation), autofilter, shape, textbox, databar/colorscale/iconset/formulacf (conditional formatting), ole (oleobject/object/embed — no Remove yet), csv (tsv). `value="=SUM(...)"` auto-detects as formula. Formulas auto-evaluated on write (150+ functions including VLOOKUP, SUMIF, IF, DATE, PMT, etc.) |
 
 ### Pivot tables (xlsx)
 
