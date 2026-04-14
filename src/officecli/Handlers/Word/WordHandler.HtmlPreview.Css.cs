@@ -1333,6 +1333,11 @@ public partial class WordHandler
         .page-body {{ flex: 1; display: flex; flex-direction: column; text-autospace: ideograph-alpha ideograph-numeric; }}
         .page-body > :first-child {{ margin-top: 0 !important; }}
         .page-body > img + h1, .page-body > img + img + h1 {{ margin-top: 0 !important; }}
+        /* Tracked changes preview: w:del → gray strikethrough, w:ins → red.
+           Use !important + descendant selector to override inline color on
+           inner <span> elements (which inherit the original run's color). */
+        del, del * {{ color: #9ca3af !important; text-decoration: line-through !important; text-decoration-color: #9ca3af !important; }}
+        ins, ins * {{ color: #dc2626 !important; text-decoration: none !important; }}
         .doc-header, .doc-footer {{ font-size: {dd.SizePt:0.##}pt; }}
         .doc-header {{ position: absolute; top: {pg.HeaderDistancePt:0.#}pt; left: {mL}; right: {mR};
             padding-bottom: 0.3em; }}

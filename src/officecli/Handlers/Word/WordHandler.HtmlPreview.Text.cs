@@ -92,13 +92,21 @@ public partial class WordHandler
             }
             else if (child.LocalName is "ins" or "moveTo")
             {
-                // Tracked insertions — render their child runs
+                // Tracked insertions — wrap in <ins> tag (red via CSS)
+                sb.Append("<ins>");
                 foreach (var insRun in child.Elements<Run>())
                     RenderRunHtml(sb, insRun, para);
+                sb.Append("</ins>");
             }
             else if (child.LocalName is "del" or "moveFrom")
             {
-                // Tracked deletions — skip (deleted content should not be displayed)
+                // Tracked deletions — wrap in <del> tag (gray strikethrough via CSS).
+                // DeletedRun contains Run elements whose Text is stored as DeletedText,
+                // not Text. RenderRunHtml handles both.
+                sb.Append("<del>");
+                foreach (var delRun in child.Elements<Run>())
+                    RenderRunHtml(sb, delRun, para);
+                sb.Append("</del>");
             }
             else if (child is Hyperlink hyperlink)
             {
@@ -205,7 +213,8 @@ public partial class WordHandler
         var hasContent = run.ChildElements.Any(c =>
             c is Break || c is TabChar || c is SymbolChar || c is CarriageReturn
             || c.LocalName is "noBreakHyphen" or "softHyphen"
-            || (c is Text t && !string.IsNullOrEmpty(t.Text)));
+            || (c is Text t && !string.IsNullOrEmpty(t.Text))
+            || (c is DeletedText dt && !string.IsNullOrEmpty(dt.Text)));
 
         if (!hasContent) return;
 
@@ -267,6 +276,12 @@ public partial class WordHandler
                 OnHtmlRenderText(sb, t.Text, rProps, style, ref handled);
                 if (!handled)
                     sb.Append(HtmlEncode(t.Text));
+            }
+            else if (child is DeletedText dt && !string.IsNullOrEmpty(dt.Text))
+            {
+                // Deleted text (inside <w:del>): same as regular text; the wrapping
+                // <del> tag in RenderParagraphContentHtml provides the visual styling.
+                sb.Append(HtmlEncode(dt.Text));
             }
             else if (child is SymbolChar sym)
             {
