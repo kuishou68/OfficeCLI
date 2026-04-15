@@ -568,12 +568,13 @@ public class ResidentServer : IDisposable
             // is typically <500ms. External apps (Word, WPS, Finder preview)
             // can open the file during the idle window between commands.
             //
-            // Note: we always open editable=true here because the command may
-            // mutate (set/add/remove). A future optimization could classify
-            // the command and open editable=false for pure-read commands
-            // (view/get/query/check/validate), yielding a shared read lock
-            // that lets multiple readers coexist.
-            using var h = DocumentHandlerFactory.Open(_filePath, editable: true);
+            // MOD(#4): see docs/cove-desktop-mods.md
+            // Pure reads should match the direct CLI path and stay read-only;
+            // otherwise lazy resident upgrades every `query/get/view` into an
+            // editable open and pays paraId/docProp normalization on each read.
+            using var h = DocumentHandlerFactory.Open(
+                _filePath,
+                editable: RequestNeedsEditableAccess(request));
             _handler = h;
             try
             {
@@ -587,6 +588,45 @@ public class ResidentServer : IDisposable
         }
 
         ExecuteCommandCore(request);
+    }
+
+    // MOD(#4): see docs/cove-desktop-mods.md
+    private static bool RequestNeedsEditableAccess(ResidentRequest request)
+    {
+        var command = (request.Command ?? "").ToLowerInvariant();
+        return command switch
+        {
+            "set" or "add" or "remove" or "move" or "swap" or "raw-set" or "add-part" => true,
+            "batch" => BatchNeedsEditableAccess(request.GetArg("batchJson")),
+            _ => false,
+        };
+    }
+
+    // MOD(#4): see docs/cove-desktop-mods.md
+    private static bool BatchNeedsEditableAccess(string? batchJson)
+    {
+        if (string.IsNullOrWhiteSpace(batchJson))
+            return false;
+
+        try
+        {
+            var items = System.Text.Json.JsonSerializer.Deserialize<List<BatchItem>>(
+                batchJson, BatchJsonContext.Default.ListBatchItem) ?? new();
+            foreach (var item in items)
+            {
+                var command = (item.Command ?? "").ToLowerInvariant();
+                if (command is "set" or "add" or "remove" or "move" or "swap" or "raw-set" or "add-part")
+                    return true;
+            }
+            return false;
+        }
+        catch
+        {
+            // Conservative fallback: if the batch payload is unreadable,
+            // preserve the old editable-open behavior rather than risk
+            // rejecting a real write batch behind a read-only handler.
+            return true;
+        }
     }
 
     private void ExecuteCommandCore(ResidentRequest request)

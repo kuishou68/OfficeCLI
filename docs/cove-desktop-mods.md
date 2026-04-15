@@ -73,6 +73,40 @@
   - `--after` 行为要求 OfficeCLI `add` 命令支持该选项（已确认支持）
   - 空印发场景下只产生 2 条横线（原代码产生 3 条空线），与 GB/T 9704 规范一致
 
+### 4. Lazy resident 读命令按只读方式打开文档
+
+- **What**：修改 `ResidentServer.cs` 的 lazy-open 路径：不再一律 `DocumentHandlerFactory.Open(..., editable: true)`，而是按命令判断。`query/get/view/raw/validate` 这类读命令走 `editable=false`；`set/add/remove/move/swap/raw-set/add-part` 和含写操作的 `batch` 才走 `editable=true`
+- **Why**：
+  - 上游为了支持 lazy resident（空闲时不持锁）把每条命令都改成了“执行前打开、执行后关闭”，但没有再区分读写，导致纯读 `query p` 也按可写模式打开
+  - Word 可写打开会立刻执行 `EnsureAllParaIds()` / `EnsureDocPropIds()` 全量扫描；对 cove-desktop 的翻译链路来说，这意味着每次 `query p` 都被错误升级成一次整篇文档的修复/归一化过程
+  - 直接 CLI 非 resident 路径的 `query` 本来就是只读打开；lazy resident 与 direct path 的语义和性能不应该在纯读命令上分叉
+- **Solves**：
+  - Cove 翻译 / 校对流程里的 `query p`、`query bookmark` 即使命中 resident，也不会再因为 lazy-open 而触发整篇文档的 editable 初始化
+  - 避免纯读命令在无用户意图时修改 paraId/docProp 元数据，减小“读操作带写副作用”
+- **Location**：`src/officecli/ResidentServer.cs`
+  - `ExecuteCommand`
+  - `RequestNeedsEditableAccess`
+  - `BatchNeedsEditableAccess`
+- **Added**：2026-04-14
+- **Risk**：
+  - 纯读命令不再顺手修复缺失/重复 paraId；这与 direct CLI path 现有行为一致，真正写入时仍会在 editable 打开时补齐
+  - `batch` 需要解析一次命令数组来判断是否包含写操作；解析失败时回退到 `editable=true`，不会影响正确性
+
+### 5. HTML 预览支持批注可视化（commentRangeStart/End → mark + aside）
+
+- **What**：`WordHandler.HtmlPreview.Text.cs` 的 `RenderParagraphContentHtml` 对 `CommentRangeStart`/`CommentRangeEnd` 输出 `<mark data-id="cmX">...</mark>` 包裹注释范围文本；`RenderRunHtml` 对 `CommentReference` 收集 ID；新增 `RenderCommentsHtml` 从 `WordprocessingCommentsPart` 读取批注内容，在文档末尾输出 `<aside data-type="comments">` 块（含作者、日期、回复关系）；`WordHandler.HtmlPreview.Css.cs` 加默认 `mark`/`aside` 基础样式。支持跨段落批注（close/reopen mark at paragraph boundaries）
+- **Why**：上游 HTML 预览完全跳过 `commentRangeStart`/`commentRangeEnd`/`commentReference` 元素，批注信息在预览中不可见。cove-desktop 校审面板需要在不修改文档的前提下显示批注标记和内容
+- **Solves**：
+  - 校审/审阅后，用户在 cove-desktop 预览区域能看到带①②③角标的批注标记和右侧批注面板
+  - 批注标记与修订标记（del/ins）正交，同时可见
+  - 前端 `comment-annotations.ts` 消费 `<mark>` + `<aside>` 标记，注入交互式 UI
+- **Location**：
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.Text.cs`（CommentRangeStart/End 分支 + RenderCommentsHtml）
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs`（HtmlRenderContext.CommentRefs + ViewAsHtml 调用点）
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.Css.cs`（mark/aside 基础样式）
+- **Added**：2026-04-15
+- **Risk**：纯视觉层改动。无批注的文档无影响。HTML 消费者若解析 `<mark>` 元素需注意新增标记
+
 ---
 
 ## 流程
