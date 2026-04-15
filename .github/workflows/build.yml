@@ -59,7 +59,7 @@ jobs:
         run: git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git" src/officecli/wiki || echo "Wiki clone failed, using fallback help"
 
       - name: Verify wiki version matches csproj version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'iOfficeAI/OfficeCLI'
         run: |
           CSPROJ_VERSION=$(grep '<Version>' src/officecli/officecli.csproj | sed 's/.*<Version>\(.*\)<\/Version>.*/\1/')
           WIKI_VERSION=$(python3 -c "import json; print(json.load(open('src/officecli/wiki/version.json'))['version'])" 2>/dev/null || echo "unknown")
