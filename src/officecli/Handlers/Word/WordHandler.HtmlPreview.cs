@@ -24,6 +24,10 @@ public partial class WordHandler
         public PageLayout? CachedPageLayout { get; set; }
         public bool RenderingBody { get; set; }
 
+        // MOD(#5): Comment annotation tracking
+        public List<string> OpenCommentMarks { get; } = new(); // stack of open comment mark IDs
+        public List<string> CommentIds { get; } = new(); // ordered comment IDs for rendering
+
         // CJK line-break tracking: accumulate character widths and insert <br> at Word-compatible positions
         public double LineWidthPt { get; set; }      // available width for current line
         public double LineAccumPt { get; set; }       // accumulated width on current line
@@ -440,6 +444,9 @@ public partial class WordHandler
         sb.AppendLine("else _wordInit();");
         sb.AppendLine("</script>");
 
+        // MOD(#5): Render comment annotations after script block
+        RenderCommentsHtml(sb);
+
         sb.AppendLine("</body>");
         sb.AppendLine("</html>");
         return sb.ToString();
@@ -810,6 +817,26 @@ public partial class WordHandler
         for (int ei = 0; ei < elements.Count; ei++)
         {
             var element = elements[ei];
+
+            // MOD(#5): Handle body-level comment range markers
+            if (element is CommentRangeStart bodyCrs)
+            {
+                var id = bodyCrs.Id?.Value;
+                if (id != null)
+                {
+                    _ctx.OpenCommentMarks.Add(id);
+                    if (!_ctx.CommentIds.Contains(id))
+                        _ctx.CommentIds.Add(id);
+                }
+                continue;
+            }
+            if (element is CommentRangeEnd bodyCre)
+            {
+                var id = bodyCre.Id?.Value;
+                if (id != null)
+                    _ctx.OpenCommentMarks.Remove(id);
+                continue;
+            }
 
             // Emit invisible anchors for watch scroll targeting
             if (element is Paragraph) { wParaCount++; sb.Append($"<a id=\"w-p-{wParaCount}\"></a>"); }

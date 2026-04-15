@@ -43,6 +43,10 @@ public partial class WordHandler
     {
         OnHtmlParagraphBegin(para);
 
+        // MOD(#5): Reopen comment marks that span from previous paragraphs
+        foreach (var cmId in _ctx.OpenCommentMarks)
+            sb.Append($"<mark data-id=\"cm{cmId}\">");
+
         // Render bookmark anchors for internal hyperlink targets
         foreach (var bm in para.Elements<BookmarkStart>())
         {
@@ -58,6 +62,42 @@ public partial class WordHandler
 
         foreach (var child in para.ChildElements)
         {
+            // MOD(#5): Handle comment range start/end within paragraphs
+            if (child is CommentRangeStart crs)
+            {
+                var id = crs.Id?.Value;
+                if (id != null)
+                {
+                    sb.Append($"<mark data-id=\"cm{id}\">");
+                    _ctx.OpenCommentMarks.Add(id);
+                    if (!_ctx.CommentIds.Contains(id))
+                        _ctx.CommentIds.Add(id);
+                }
+                continue;
+            }
+            if (child is CommentRangeEnd cre)
+            {
+                var id = cre.Id?.Value;
+                if (id != null && _ctx.OpenCommentMarks.Contains(id))
+                {
+                    // Close marks in reverse order up to this one, then reopen the rest
+                    var idx = _ctx.OpenCommentMarks.LastIndexOf(id);
+                    var toReopen = new List<string>();
+                    for (int i = _ctx.OpenCommentMarks.Count - 1; i > idx; i--)
+                    {
+                        sb.Append("</mark>");
+                        toReopen.Add(_ctx.OpenCommentMarks[i]);
+                    }
+                    sb.Append("</mark>"); // close the target mark
+                    _ctx.OpenCommentMarks.RemoveAt(idx);
+                    // Reopen marks that were closed just for nesting
+                    toReopen.Reverse();
+                    foreach (var reopenId in toReopen)
+                        sb.Append($"<mark data-id=\"cm{reopenId}\">");
+                }
+                continue;
+            }
+
             if (child is Run run)
             {
                 // Find drawing (direct child or inside mc:AlternateContent Choice)
@@ -162,6 +202,10 @@ public partial class WordHandler
                     RenderRunHtml(sb, fldRun, para);
             }
         }
+
+        // MOD(#5): Close comment marks that span to next paragraphs (will be reopened there)
+        for (int i = _ctx.OpenCommentMarks.Count - 1; i >= 0; i--)
+            sb.Append("</mark>");
 
         OnHtmlParagraphEnd(sb);
     }
@@ -464,6 +508,78 @@ public partial class WordHandler
             sb.AppendLine("</div>");
         }
         sb.AppendLine("</div>");
+    }
+
+    // MOD(#5): Render comment annotations as <aside data-type="comments"> block
+    private void RenderCommentsHtml(StringBuilder sb)
+    {
+        var commentsPart = _doc.MainDocumentPart?.WordprocessingCommentsPart;
+        if (commentsPart?.Comments == null) return;
+
+        var comments = commentsPart.Comments.Elements<Comment>().ToList();
+        if (comments.Count == 0) return;
+
+        // Build a set of IDs that have ranges in the document (root comments)
+        var rootIds = new HashSet<string>(_ctx.CommentIds);
+
+        sb.AppendLine("<aside data-type=\"comments\">");
+
+        foreach (var comment in comments)
+        {
+            var id = comment.Id?.Value;
+            if (id == null) continue;
+
+            var author = comment.Author?.Value ?? "";
+
+            // Extract comment text from paragraphs
+            var textSb = new StringBuilder();
+            foreach (var p in comment.Elements<Paragraph>())
+            {
+                if (textSb.Length > 0) textSb.Append("<br>");
+                foreach (var run in p.Elements<Run>())
+                {
+                    var t = run.GetFirstChild<Text>();
+                    if (t != null) textSb.Append(HtmlEncode(t.Text));
+                }
+            }
+
+            sb.Append($"  <p data-id=\"cm{id}\" data-author=\"{HtmlEncodeAttr(author)}\"");
+
+            // Detect reply-to: comment without its own range is a reply to the previous root comment
+            if (!rootIds.Contains(id) && _ctx.CommentIds.Count > 0)
+            {
+                // Find the closest root comment that precedes this ID numerically
+                string? parentId = null;
+                if (int.TryParse(id, out var numId))
+                {
+                    for (int i = numId - 1; i >= 0; i--)
+                    {
+                        var candidateId = i.ToString();
+                        if (rootIds.Contains(candidateId))
+                        {
+                            parentId = candidateId;
+                            break;
+                        }
+                    }
+                }
+                if (parentId != null)
+                    sb.Append($" data-reply-to=\"cm{parentId}\"");
+            }
+
+            // Check for resolved/done state (w16cid:done="1")
+            foreach (var attr in comment.GetAttributes())
+            {
+                if (attr.LocalName == "done" && attr.Value == "1")
+                {
+                    sb.Append(" data-resolved=\"true\"");
+                    break;
+                }
+            }
+
+            sb.AppendLine($">{textSb}</p>");
+        }
+
+        sb.AppendLine("</aside>");
     }
 
     /// <summary>Get the numbering format for footnotes (default: decimal per OOXML spec §17.11.11).</summary>

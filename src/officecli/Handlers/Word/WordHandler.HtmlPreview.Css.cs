@@ -1403,6 +1403,9 @@ public partial class WordHandler
            inner <span> elements (which inherit the original run's color). */
         del, del * {{ color: #9ca3af !important; text-decoration: line-through !important; text-decoration-color: #9ca3af !important; }}
         ins, ins * {{ color: #dc2626 !important; text-decoration: none !important; }}
+        /* MOD(#5): Comment annotation base styles — mark highlighted ranges, aside panel hidden by default (frontend injects interactive UI) */
+        mark[data-id] {{ background: #fef9c3; padding: 0 1px; }}
+        aside[data-type=""comments""] {{ display: none; }}
         .doc-header, .doc-footer {{ font-size: {dd.SizePt:0.##}pt; }}
         .doc-header {{ position: absolute; top: {pg.HeaderDistancePt:0.#}pt; left: {mL}; right: {mR};
             padding-bottom: 0.3em; }}
