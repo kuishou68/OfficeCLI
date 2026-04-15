@@ -150,6 +150,7 @@ public partial class WordHandler
     private string GetParagraphInlineCss(Paragraph para, bool isListItem = false)
     {
         var parts = new List<string>();
+        var docDefaults = ReadDocDefaults();
 
         // Set paragraph font-size to match the first run's resolved font-size.
         // This prevents the CSS "strut" (block container's anonymous inline box) from inflating
@@ -168,6 +169,8 @@ public partial class WordHandler
         if (pProps == null)
         {
             var styleCss = ResolveParagraphStyleCss(para);
+            if (!styleCss.Contains("line-height:", StringComparison.Ordinal))
+                parts.Add(BuildDefaultParagraphLineHeightCss(para, null, docDefaults));
             if (parts.Count > 0 && !string.IsNullOrEmpty(styleCss))
                 return string.Join(";", parts) + ";" + styleCss;
             if (parts.Count > 0) return string.Join(";", parts);
@@ -277,16 +280,16 @@ public partial class WordHandler
                     parts.Add($"line-height:{Units.TwipsToPt(lv):0.##}pt");
                 }
             }
-
-            // If no explicit line-height was set, use font metrics ratio
-            if (!parts.Any(p => p.StartsWith("line-height")))
-            {
-                var paraFont = ResolveParaFontForLineHeight(para);
-                var ratio = FontMetricsReader.GetRatio(paraFont);
-                if (ratio > 1.01 || ratio < 0.99) // only if meaningfully different from 1.0
-                    parts.Add($"line-height:{ratio:0.##}");
-            }
         }
+
+        // MOD(#6): see cove-desktop-mods.md
+        // Always emit an inline line-height derived from the paragraph's
+        // effective spacing + actual font metrics. Without this, paragraphs
+        // that lack explicit w:spacing fall back to the global <p> CSS and use
+        // the document default font's metrics instead of the paragraph's real
+        // EastAsia/Ascii font, which makes Word/WPS previews look too tight.
+        if (!parts.Any(p => p.StartsWith("line-height", StringComparison.Ordinal)))
+            parts.Add(BuildDefaultParagraphLineHeightCss(para, styleSpacing, docDefaults));
 
         // Shading / background (direct or from style)
         var shading = pProps.Shading;
@@ -351,6 +354,33 @@ public partial class WordHandler
         }
 
         return string.Join(";", parts);
+    }
+
+    private string BuildDefaultParagraphLineHeightCss(
+        Paragraph para,
+        SpacingBetweenLines? styleSpacing,
+        DocDef docDefaults)
+    {
+        var lineVal = para.ParagraphProperties?.SpacingBetweenLines?.Line?.Value
+            ?? styleSpacing?.Line?.Value;
+        var rule = para.ParagraphProperties?.SpacingBetweenLines?.LineRule?.InnerText
+            ?? styleSpacing?.LineRule?.InnerText;
+
+        if (lineVal is string explicitLine)
+        {
+            if ((rule == "auto" || rule == null) && int.TryParse(explicitLine, out var autoLine))
+            {
+                var paraFont = ResolveParaFontForLineHeight(para);
+                var ratio = FontMetricsReader.GetRatio(paraFont);
+                return $"line-height:{autoLine / 240.0 * ratio:0.##}";
+            }
+            if (rule == "exact" || rule == "atLeast")
+                return $"line-height:{Units.TwipsToPt(explicitLine):0.##}pt";
+        }
+
+        var defaultFont = ResolveParaFontForLineHeight(para);
+        var defaultRatio = FontMetricsReader.GetRatio(defaultFont);
+        return $"line-height:{docDefaults.LineHeight * defaultRatio:0.##}";
     }
 
     /// <summary>
@@ -447,15 +477,32 @@ public partial class WordHandler
 
     private SpacingBetweenLines? ResolveSpacingFromStyle(string? styleId)
     {
+        // MOD(#6): see cove-desktop-mods.md
+        // Merge spacing property-by-property across the style chain and
+        // docDefaults instead of returning the first <w:spacing> node we hit.
+        // Many docs split before/after/line across different levels; stopping
+        // early loses inherited values and causes preview spacing drift.
+        var merged = new SpacingBetweenLines();
+
+        void MergeSpacing(SpacingBetweenLines? source)
+        {
+            if (source == null) return;
+            merged.Before ??= source.Before?.Value;
+            merged.BeforeLines ??= source.BeforeLines?.Value;
+            merged.After ??= source.After?.Value;
+            merged.AfterLines ??= source.AfterLines?.Value;
+            merged.Line ??= source.Line?.Value;
+            merged.LineRule ??= source.LineRule?.Value;
+        }
+
         // If no explicit style, use the default paragraph style (Normal)
         if (styleId == null)
         {
             var defaultStyle = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.Type?.Value == StyleValues.Paragraph && s.Default?.Value == true);
-            if (defaultStyle?.StyleParagraphProperties?.SpacingBetweenLines != null)
-                return defaultStyle.StyleParagraphProperties.SpacingBetweenLines;
-            return null;
+            MergeSpacing(defaultStyle?.StyleParagraphProperties?.SpacingBetweenLines);
         }
+
         var visited = new HashSet<string>();
         var currentStyleId = styleId;
         while (currentStyleId != null && visited.Add(currentStyleId))
@@ -463,11 +510,21 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var sp = style.StyleParagraphProperties?.SpacingBetweenLines;
-            if (sp != null) return sp;
+            MergeSpacing(style.StyleParagraphProperties?.SpacingBetweenLines);
             currentStyleId = style.BasedOn?.Val?.Value;
         }
-        return null;
+
+        MergeSpacing(_doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+            ?.DocDefaults?.ParagraphPropertiesDefault?.ParagraphPropertiesBaseStyle?.SpacingBetweenLines);
+
+        return merged.Before != null
+            || merged.BeforeLines != null
+            || merged.After != null
+            || merged.AfterLines != null
+            || merged.Line != null
+            || merged.LineRule != null
+            ? merged
+            : null;
     }
 
     /// <summary>
@@ -1174,18 +1231,26 @@ public partial class WordHandler
     /// <summary>Resolve the dominant font for line-height calculation from a paragraph's runs.</summary>
     private string ResolveParaFontForLineHeight(Paragraph para)
     {
-        // Use the first run's ascii font; fall back to document default
-        var firstRun = para.Elements<Run>().FirstOrDefault();
+        // MOD(#6): see cove-desktop-mods.md
+        // Prefer EastAsia fonts for DOCX preview metrics. Chinese/Japanese/Korean
+        // paragraphs often carry the real line box in rFonts.eastAsia while
+        // ascii/highAnsi stays on a Western fallback like Arial.
+        var firstRun = para.Elements<Run>().FirstOrDefault(r =>
+            r.ChildElements.Any(c => c is Text t && !string.IsNullOrEmpty(t.Text)));
         if (firstRun != null)
         {
             var rProps = ResolveEffectiveRunProperties(firstRun, para);
-            var font = rProps.RunFonts?.Ascii?.Value ?? rProps.RunFonts?.HighAnsi?.Value;
+            var font = rProps.RunFonts?.EastAsia?.Value
+                ?? rProps.RunFonts?.Ascii?.Value
+                ?? rProps.RunFonts?.HighAnsi?.Value;
             if (!string.IsNullOrEmpty(font)) return font;
         }
         // Fall back to document default font
         var defFont = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
-            ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.Ascii?.Value;
-        return defFont ?? "Calibri";
+            ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.EastAsia?.Value
+            ?? _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+                ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.Ascii?.Value;
+        return defFont ?? ReadDocDefaults().Font;
     }
 
     private string? ResolveStyleFontSize(string styleId)

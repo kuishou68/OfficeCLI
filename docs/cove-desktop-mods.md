@@ -107,6 +107,28 @@
 - **Added**：2026-04-15
 - **Risk**：纯视觉层改动。无批注的文档无影响。HTML 消费者若解析 `<mark>` 元素需注意新增标记
 
+### 6. HTML 预览按 DOCX 样式链和实际字体修正段落行高/段距
+
+- **What**：修改 `WordHandler.HtmlPreview.Css.cs`：
+  - `ResolveSpacingFromStyle` 改为按属性级别合并 `w:style` basedOn 链和 `docDefaults` 的 `w:spacing`
+  - `GetParagraphInlineCss` 对每个段落稳定输出 inline `line-height`
+  - `ResolveParaFontForLineHeight` 改为优先读取 `rFonts.eastAsia`，不再只看 `ascii/highAnsi`
+- **Why**：
+  - 原实现一旦在样式链上遇到第一个 `w:spacing` 节点就提前返回；如果上层样式只定义了 `before/after`，而 `line` 在更高层或 `docDefaults`，继承会被截断
+  - 段落没有显式 `w:spacing` 时，会回退到全局 `<p>` CSS，并使用文档默认字体的 metrics；对中文文档来说，真实行高往往由 `eastAsia` 字体决定，结果会比 WPS/Word 更紧
+- **Solves**：
+  - Word/WPS 中依赖样式继承的段落，在 cove-desktop 预览里能拿到更接近原始 DOCX 的行高、段前段后距
+  - 中文文档中 `宋体/仿宋/楷体` 等 EastAsia 字体的行框不再被西文字体 metrics 误导
+- **Location**：
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.Css.cs`
+  - `GetParagraphInlineCss`
+  - `ResolveSpacingFromStyle`
+  - `ResolveParaFontForLineHeight`
+- **Added**：2026-04-15
+- **Risk**：
+  - HTML 预览对“无显式 spacing 的段落”会更积极输出 inline `line-height`，可能改变少量历史文档的旧预览截图
+  - 改动只影响 `view ... html` 预览层，不影响 DOCX 写回
+
 ---
 
 ## 流程
