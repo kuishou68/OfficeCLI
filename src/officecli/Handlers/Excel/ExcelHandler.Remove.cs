@@ -90,6 +90,17 @@ public partial class ExcelHandler
                     .ToList()
                 : new List<PivotTableCacheDefinitionPart>();
 
+            // Evict the worksheet part from the row cache and dirty set BEFORE
+            // DeletePart destroys it. FlushDirtyParts() calls GetSheet() on
+            // every entry in _dirtyWorksheets; if the part is already destroyed
+            // that call throws InvalidOperationException.
+            if (sheetWsPart != null)
+            {
+                var removedSheetData = GetSheet(sheetWsPart).GetFirstChild<SheetData>();
+                if (removedSheetData != null) InvalidateRowIndex(removedSheetData);
+                _dirtyWorksheets.Remove(sheetWsPart);
+            }
+
             sheet.Remove();
             if (relId != null)
                 workbookPart.DeletePart(workbookPart.GetPartById(relId));
@@ -600,6 +611,8 @@ public partial class ExcelHandler
 
         if (sheetData != null)
         {
+            // Row indices change after a shift — cached positions are stale
+            InvalidateRowIndex(sheetData);
             // Process in reverse order to avoid collision
             foreach (var row in sheetData.Elements<Row>().OrderByDescending(r => r.RowIndex?.Value ?? 0).ToList())
             {
@@ -813,6 +826,8 @@ public partial class ExcelHandler
         // 1. Shift all rows after the deleted row: update RowIndex + all CellReferences
         if (sheetData != null)
         {
+            // Row indices change after a shift — cached positions are stale
+            InvalidateRowIndex(sheetData);
             foreach (var row in sheetData.Elements<Row>().ToList())
             {
                 var rowIdx = (int)(row.RowIndex?.Value ?? 0);

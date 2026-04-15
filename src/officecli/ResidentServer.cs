@@ -68,6 +68,15 @@ public class ResidentServer : IDisposable
     private CancellationTokenSource _idleCts = new();
     private bool _disposed;
 
+    // Safe stderr logging: the parent process may have redirected our stderr
+    // to a pipe whose read-end closes when the parent exits, so any
+    // Console.Error.WriteLine after that point throws IOException.  Swallow
+    // it silently — these are best-effort diagnostics, not critical output.
+    private static void LogStderr(string message)
+    {
+        try { Console.Error.WriteLine(message); } catch (IOException) { }
+    }
+
     // Valid idle-timeout range: 1s .. 24h. Anything outside falls back to
     // the 12min default. A value of "0" is rejected (would be an infinite-
     // busy spin on the watchdog task). Shared between the startup env-var
@@ -237,7 +246,7 @@ public class ResidentServer : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"Resident error: {ex.Message}");
+                    LogStderr($"Resident error: {ex.Message}");
                     // currentMain is still the pre-created replacement; it is
                     // still valid for the next iteration's WaitForConnectionAsync.
                 }
@@ -292,7 +301,7 @@ public class ResidentServer : IDisposable
                 // cancelling _mainCts / _pingCts, so the "ping liveness ⇔
                 // file locked" invariant is preserved end-to-end: the
                 // ping pipe stays alive until handler.Dispose() completes.
-                Console.Error.WriteLine($"Resident idle for {currentTimeout.TotalMinutes} minutes, closing.");
+                LogStderr($"Resident idle for {currentTimeout.TotalMinutes} minutes, closing.");
                 _ = ShutdownAsync();
                 break;
             }
@@ -351,7 +360,7 @@ public class ResidentServer : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"Ping responder error: {ex.Message}");
+                    LogStderr($"Ping responder error: {ex.Message}");
                     // currentMain/current is already the replacement;
                     // loop continues.
                 }
@@ -417,7 +426,7 @@ public class ResidentServer : IDisposable
                 try { await ShutdownAsync(); }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"Shutdown error during __close__: {ex.Message}");
+                    LogStderr($"Shutdown error during __close__: {ex.Message}");
                 }
 
                 var response = MakeResponse(0, "Closing resident.", "");
@@ -431,7 +440,7 @@ public class ResidentServer : IDisposable
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Ping handler error: {ex.Message}");
+            LogStderr($"Ping handler error: {ex.Message}");
         }
         finally
         {
@@ -458,7 +467,7 @@ public class ResidentServer : IDisposable
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Resident error: {ex.Message}");
+            LogStderr($"Resident error: {ex.Message}");
         }
         finally
         {
@@ -1198,13 +1207,13 @@ public class ResidentServer : IDisposable
         {
             if (!ShutdownAsync().Wait(TimeSpan.FromMinutes(10)))
             {
-                Console.Error.WriteLine("Warning: shutdown timed out after 10 minutes, forcing exit.");
+                LogStderr("Warning: shutdown timed out after 10 minutes, forcing exit.");
                 Environment.Exit(1);
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Warning: shutdown error: {ex.Message}");
+            LogStderr($"Warning: shutdown error: {ex.Message}");
         }
 
         try { _commandLock.Dispose(); } catch { }
@@ -1267,7 +1276,7 @@ public class ResidentServer : IDisposable
             }
             else
             {
-                Console.Error.WriteLine("Warning: timeout waiting for in-flight command to drain.");
+                LogStderr("Warning: timeout waiting for in-flight command to drain.");
             }
         }
         catch (ObjectDisposedException) { /* _commandLock already disposed */ }
@@ -1285,7 +1294,7 @@ public class ResidentServer : IDisposable
             try { _handler.Dispose(); }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Warning: handler dispose error: {ex.Message}");
+                LogStderr($"Warning: handler dispose error: {ex.Message}");
             }
         }
 

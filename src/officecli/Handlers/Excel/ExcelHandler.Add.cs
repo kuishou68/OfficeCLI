@@ -370,6 +370,7 @@ public partial class ExcelHandler
                         ?? throw new InvalidOperationException("Workbook not found");
                     var styleManager = new ExcelStyleManager(cellWbPart);
                     cell.StyleIndex = styleManager.ApplyStyle(cell, cellStyleProps);
+                    _dirtyStylesheet = true;
                 }
 
                 DeleteCalcChainIfPresent();
@@ -856,7 +857,7 @@ public partial class ExcelHandler
                 }
                 dxfs.Append(dxf);
                 dxfs.Count = (uint)dxfs.Elements<DifferentialFormat>().Count();
-                stylesheet.Save();
+                _dirtyStylesheet = true;
 
                 var dxfId = dxfs.Count!.Value - 1;
 
@@ -1535,7 +1536,7 @@ public partial class ExcelHandler
                 }
                 tableParts.AppendChild(new TablePart { Id = tblWorksheet.GetIdOfPart(tableDefPart) });
                 tableParts.Count = (uint)tableParts.Elements<TablePart>().Count();
-                tblWs.Save();
+                SaveWorksheet(tblWorksheet);
 
                 var tblIdx = tblWorksheet.TableDefinitionParts.ToList().IndexOf(tableDefPart) + 1;
                 return $"/{tblSheetName}/table[{tblIdx}]";
@@ -2254,7 +2255,7 @@ public partial class ExcelHandler
                     }
                     cfNewDxfs.Append(cfNewDxf);
                     cfNewDxfs.Count = (uint)cfNewDxfs.Elements<DifferentialFormat>().Count();
-                    cfNewStylesheet.Save();
+                    _dirtyStylesheet = true;
                     cfNewRule.FormatId = cfNewDxfs.Count!.Value - 1;
                 }
 

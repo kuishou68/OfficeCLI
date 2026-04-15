@@ -917,6 +917,8 @@ Sheet properties (/SheetName):
   header         Print header text
   footer         Print footer text
   sort           Sort range and column (e.g. "A1:D10,B" or "A1:D10,B,desc")
+  sortHeader     true/false — treat the first row of the sort range as a header
+                 (excluded from the reorder). Used together with sort.
 
 AutoFilter (/SheetName/autofilter):
   range          Update filter range (e.g. A1:F100)

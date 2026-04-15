@@ -54,9 +54,16 @@ internal static partial class ChartExBuilder
 
         // 1. Build ChartData
         var chartData = new CX.ChartData();
+
+        // boxWhisker: native Excel structure is one cx:data per group (numDim only,
+        // no strDim) + one cx:series per group. The category axis positions each
+        // group automatically by series order. Any strDim causes Excel to stack
+        // all boxes onto the same X position.
         for (int si = 0; si < seriesData.Count; si++)
         {
-            var data = BuildDataBlock((uint)si, normalized, categories, seriesData[si].values);
+            CX.Data data = normalized == "boxwhisker"
+                ? BuildBoxWhiskerGroupDataBlock((uint)si, seriesData[si].values, seriesData[si].name)
+                : BuildDataBlock((uint)si, normalized, categories, seriesData[si].values);
             chartData.AppendChild(data);
         }
         chartSpace.AppendChild(chartData);
@@ -93,71 +100,74 @@ internal static partial class ChartExBuilder
         // (any explicit truthy value enables). "false" / "off" / "0" disables.
         var showDataLabels = IsTruthyProp(properties, "dataLabels", defaultValue: false);
 
+        // All chart types including boxWhisker: one cx:series per data set.
+        // boxWhisker gets one series per group, matching the one-cx:data-per-group
+        // structure above. Colors are set per-series via cx:spPr.
         for (int si = 0; si < seriesData.Count; si++)
         {
-            var series = new CX.Series { LayoutId = new EnumValue<CX.SeriesLayout>(
-                ParseSeriesLayout(layoutId)) };
+                var series = new CX.Series { LayoutId = new EnumValue<CX.SeriesLayout>(
+                    ParseSeriesLayout(layoutId)) };
 
-            // Schema order for cx:series:
-            //   tx → spPr → valueColors → valueColorPositions → dataPoint*
-            //   → dataLabels → dataId → layoutPr → axisId* → extLst
-            series.AppendChild(new CX.Text(
-                new CX.TextData(
-                    new CX.Formula(""),
-                    new CX.VXsdstring(seriesData[si].name))));
+                // Schema order for cx:series:
+                //   tx → spPr → valueColors → valueColorPositions → dataPoint*
+                //   → dataLabels → dataId → layoutPr → axisId* → extLst
+                series.AppendChild(new CX.Text(
+                    new CX.TextData(
+                        new CX.Formula(""),
+                        new CX.VXsdstring(seriesData[si].name))));
 
-            // Per-series solid fill
-            if (seriesColors != null && si < seriesColors.Length && !string.IsNullOrEmpty(seriesColors[si]))
-            {
-                var (rgb, _) = ParseHelpers.SanitizeColorForOoxml(seriesColors[si]);
-                series.AppendChild(new CX.ShapeProperties(
-                    new Drawing.SolidFill(
-                        new Drawing.RgbColorModelHex { Val = rgb })));
-            }
-
-            // Optional series.shadow (applied to every series). Reuses the
-            // ApplyCxSeriesShadow helper so the Add and Set paths emit
-            // identical trees.
-            var seriesShadow = properties.GetValueOrDefault("series.shadow")
-                            ?? properties.GetValueOrDefault("seriesshadow");
-            if (!string.IsNullOrEmpty(seriesShadow))
-                ApplyCxSeriesShadow(series, seriesShadow);
-
-            // Data labels (value count above each bar)
-            if (showDataLabels)
-            {
-                var dl = new CX.DataLabels { Pos = CX.DataLabelPos.OutEnd };
-                dl.AppendChild(new CX.DataLabelVisibilities
+                // Per-series solid fill
+                if (seriesColors != null && si < seriesColors.Length && !string.IsNullOrEmpty(seriesColors[si]))
                 {
-                    Value = true,
-                    SeriesName = false,
-                    CategoryName = false,
-                });
-                // Optional number format (datalabels.numfmt / labelnumfmt).
-                var dlNumFmt = properties.GetValueOrDefault("datalabels.numfmt")
-                            ?? properties.GetValueOrDefault("labelnumfmt")
-                            ?? properties.GetValueOrDefault("datalabels.format")
-                            ?? properties.GetValueOrDefault("labelformat");
-                if (!string.IsNullOrEmpty(dlNumFmt))
-                {
-                    dl.NumberFormat = new CX.NumberFormat
-                    {
-                        FormatCode = dlNumFmt,
-                        SourceLinked = false,
-                    };
+                    var (rgb, _) = ParseHelpers.SanitizeColorForOoxml(seriesColors[si]);
+                    series.AppendChild(new CX.ShapeProperties(
+                        new Drawing.SolidFill(
+                            new Drawing.RgbColorModelHex { Val = rgb })));
                 }
-                series.AppendChild(dl);
-            }
 
-            series.AppendChild(new CX.DataId { Val = (uint)si });
+                // Optional series.shadow (applied to every series). Reuses the
+                // ApplyCxSeriesShadow helper so the Add and Set paths emit
+                // identical trees.
+                var seriesShadow = properties.GetValueOrDefault("series.shadow")
+                                ?? properties.GetValueOrDefault("seriesshadow");
+                if (!string.IsNullOrEmpty(seriesShadow))
+                    ApplyCxSeriesShadow(series, seriesShadow);
 
-            // Chart-type specific layoutPr (histogram binning, treemap label
-            // layout, boxWhisker stats, etc.)
-            var layoutPr = BuildLayoutProperties(normalized, properties, seriesData[si].values.Length);
-            if (layoutPr != null)
-                series.AppendChild(layoutPr);
+                // Data labels (value count above each bar)
+                if (showDataLabels)
+                {
+                    var dl = new CX.DataLabels { Pos = CX.DataLabelPos.OutEnd };
+                    dl.AppendChild(new CX.DataLabelVisibilities
+                    {
+                        Value = true,
+                        SeriesName = false,
+                        CategoryName = false,
+                    });
+                    // Optional number format (datalabels.numfmt / labelnumfmt).
+                    var dlNumFmt = properties.GetValueOrDefault("datalabels.numfmt")
+                                ?? properties.GetValueOrDefault("labelnumfmt")
+                                ?? properties.GetValueOrDefault("datalabels.format")
+                                ?? properties.GetValueOrDefault("labelformat");
+                    if (!string.IsNullOrEmpty(dlNumFmt))
+                    {
+                        dl.NumberFormat = new CX.NumberFormat
+                        {
+                            FormatCode = dlNumFmt,
+                            SourceLinked = false,
+                        };
+                    }
+                    series.AppendChild(dl);
+                }
 
-            plotAreaRegion.AppendChild(series);
+                series.AppendChild(new CX.DataId { Val = (uint)si });
+
+                // Chart-type specific layoutPr (histogram binning, treemap label
+                // layout, boxWhisker stats, etc.)
+                var layoutPr = BuildLayoutProperties(normalized, properties, seriesData[si].values.Length);
+                if (layoutPr != null)
+                    series.AppendChild(layoutPr);
+
+                plotAreaRegion.AppendChild(series);
         }
 
         plotArea.AppendChild(plotAreaRegion);
@@ -664,6 +674,35 @@ internal static partial class ChartExBuilder
               || v.Equals("no", StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// Build a single cx:data block for one boxWhisker group.
+    /// Includes a strDim type="cat" with the group name repeated once per data
+    /// point so the X axis shows the group label. The strDim is per-data-block
+    /// (not shared across series), so each group stays at its own X position.
+    /// </summary>
+    private static CX.Data BuildBoxWhiskerGroupDataBlock(uint id, double[] values, string groupName)
+    {
+        var data = new CX.Data { Id = id };
+
+        // strDim provides the X-axis label for this group.
+        // Repeat the group name once per data point (required: ptCount must equal numDim ptCount).
+        var strDim = new CX.StringDimension { Type = CX.StringDimensionType.Cat };
+        var strLvl = new CX.StringLevel { PtCount = (uint)values.Length };
+        for (int i = 0; i < values.Length; i++)
+            strLvl.AppendChild(new CX.ChartStringValue(groupName) { Index = (uint)i });
+        strDim.AppendChild(strLvl);
+        data.AppendChild(strDim);
+
+        var numDim = new CX.NumericDimension { Type = CX.NumericDimensionType.Val };
+        var numLvl = new CX.NumericLevel { PtCount = (uint)values.Length, FormatCode = "General" };
+        for (int i = 0; i < values.Length; i++)
+            numLvl.AppendChild(new CX.NumericValue(values[i].ToString("G", CultureInfo.InvariantCulture)) { Idx = (uint)i });
+        numDim.AppendChild(numLvl);
+        data.AppendChild(numDim);
+
+        return data;
+    }
+
     private static CX.Data BuildDataBlock(uint id, string chartType, string[]? categories, double[] values)
     {
         var data = new CX.Data { Id = id };
@@ -672,9 +711,21 @@ internal static partial class ChartExBuilder
         if (categories != null && chartType is "funnel" or "treemap" or "sunburst" or "boxwhisker")
         {
             var strDim = new CX.StringDimension { Type = CX.StringDimensionType.Cat };
-            var strLvl = new CX.StringLevel { PtCount = (uint)categories.Length };
-            for (int i = 0; i < categories.Length; i++)
-                strLvl.AppendChild(new CX.ChartStringValue(categories[i]) { Index = (uint)i });
+
+            // boxWhisker: each data block carries ONE group label but N values.
+            // strDim.PtCount must equal numDim.PtCount — Excel requires them to
+            // match or it collapses all series onto the same X position.
+            // Repeat the single label N times (once per data point) so the
+            // counts align. funnel/treemap/sunburst keep their original 1:1 mapping.
+            bool repeatSingle = chartType == "boxwhisker" && categories.Length == 1;
+            int ptCount = repeatSingle ? values.Length : categories.Length;
+
+            var strLvl = new CX.StringLevel { PtCount = (uint)ptCount };
+            for (int i = 0; i < ptCount; i++)
+            {
+                string cat = repeatSingle ? categories[0] : categories[i];
+                strLvl.AppendChild(new CX.ChartStringValue(cat) { Index = (uint)i });
+            }
             strDim.AppendChild(strLvl);
             data.AppendChild(strDim);
         }
