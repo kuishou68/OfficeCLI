@@ -516,15 +516,39 @@ public partial class WordHandler
         var commentsPart = _doc.MainDocumentPart?.WordprocessingCommentsPart;
         if (commentsPart?.Comments == null) return;
 
-        var comments = commentsPart.Comments.Elements<Comment>().ToList();
-        if (comments.Count == 0) return;
+        var allComments = commentsPart.Comments.Elements<Comment>().ToList();
+        if (allComments.Count == 0) return;
+
+        // Build a lookup by ID for quick access
+        var commentById = new Dictionary<string, Comment>();
+        foreach (var c in allComments)
+        {
+            var cid = c.Id?.Value;
+            if (cid != null) commentById[cid] = c;
+        }
 
         // Build a set of IDs that have ranges in the document (root comments)
         var rootIds = new HashSet<string>(_ctx.CommentIds);
 
+        // Output comments in document position order (mark appearance order),
+        // then append any remaining comments (replies without ranges)
+        var ordered = new List<Comment>();
+        var emitted = new HashSet<string>();
+        foreach (var id in _ctx.CommentIds)
+        {
+            if (commentById.TryGetValue(id, out var c) && emitted.Add(id))
+                ordered.Add(c);
+        }
+        foreach (var c in allComments)
+        {
+            var cid = c.Id?.Value;
+            if (cid != null && emitted.Add(cid))
+                ordered.Add(c);
+        }
+
         sb.AppendLine("<aside data-type=\"comments\">");
 
-        foreach (var comment in comments)
+        foreach (var comment in ordered)
         {
             var id = comment.Id?.Value;
             if (id == null) continue;
