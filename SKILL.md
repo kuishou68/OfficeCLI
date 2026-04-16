@@ -348,6 +348,18 @@ officecli set slides.pptx / --prop defaultFont=Arial --prop show.loop=true --pro
 
 Run `officecli <format> set /` for all available document-level properties (docDefaults, docGrid, CJK spacing, calc, print, show, theme, extended).
 
+### Sort (xlsx)
+
+```bash
+# Sheet-level: sort entire used range by column C descending
+officecli set data.xlsx /Sheet1 --prop sort="C desc" --prop sortHeader=true
+
+# Range-level: sort a specific range by column A
+officecli set data.xlsx '/Sheet1/A1:D100' --prop sort="A asc" --prop sortHeader=true
+```
+
+Sort key format: `COL DIR[, COL DIR ...]` (column letter + `asc`/`desc`). Rejects ranges with merged cells or formulas. Sidecar metadata (hyperlinks, comments, conditional formatting, drawings) follows rows automatically.
+
 **Text-anchored insert** (`--after find:X` / `--before find:X`):
 
 The `--after` and `--before` flags accept a `find:` prefix to locate an insertion point by text match within a paragraph.

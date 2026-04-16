@@ -21,15 +21,13 @@ internal static partial class ChartExBuilder
 {
     internal static readonly HashSet<string> ExtendedChartTypes = new(StringComparer.OrdinalIgnoreCase)
     {
-        "funnel", "treemap", "sunburst", "boxwhisker", "histogram"
-        // TODO(chartex-pareto): real Excel Pareto is NOT a single-series
-        // layoutId="paretoLine" chart — it's a histogram (clusteredColumn)
-        // with a paretoLine overlay series sharing the same data. Needs
-        // two-series plumbing in BuildExtendedChartSpace + a way to
-        // express the cumulative % on the second series. Out of scope
-        // for the cx-knob-parity pass; the DetectExtendedChartType
-        // reverse mapping on line 504 already reads paretoLine for
-        // round-trip Get() of files created in real Excel.
+        "funnel", "treemap", "sunburst", "boxwhisker", "histogram", "pareto"
+        // Pareto is a 2-series structure: clusteredColumn (sorted bars) +
+        // paretoLine (cumulative-% overlay). PreparePareto pre-sorts desc
+        // and computes cumulative %. The value axis is forced to 0-100 so
+        // both bars and cumulative line share the same 0-100 range.
+        // DetectExtendedChartType handles both OfficeCli-authored and
+        // MSO-authored (same 2-series shape) forms.
     };
 
     internal static bool IsExtendedChartType(string chartType)
@@ -50,6 +48,12 @@ internal static partial class ChartExBuilder
     {
         var normalized = chartType.ToLowerInvariant().Replace(" ", "").Replace("_", "").Replace("-", "");
 
+        // Pareto pre-sorts descending and keeps a single series. The
+        // paretoLine series is appended after the main loop with ownerIdx=0
+        // (derives from the clusteredColumn series — no separate data needed).
+        if (normalized == "pareto")
+            (categories, seriesData) = PreparePareto(categories, seriesData);
+
         var chartSpace = new CX.ChartSpace();
 
         // 1. Build ChartData
@@ -59,7 +63,8 @@ internal static partial class ChartExBuilder
         // no strDim) + one cx:series per group. The category axis positions each
         // group automatically by series order. Any strDim causes Excel to stack
         // all boxes onto the same X position.
-        for (int si = 0; si < seriesData.Count; si++)
+        var dataBlockCount = seriesData.Count;
+        for (int si = 0; si < dataBlockCount; si++)
         {
             CX.Data data = normalized == "boxwhisker"
                 ? BuildBoxWhiskerGroupDataBlock((uint)si, seriesData[si].values, seriesData[si].name)
@@ -86,6 +91,7 @@ internal static partial class ChartExBuilder
             "sunburst" => "sunburst",
             "boxwhisker" => "boxWhisker",
             "histogram" => "clusteredColumn",
+            "pareto" => "clusteredColumn",
             _ => "funnel"
         };
 
@@ -162,22 +168,70 @@ internal static partial class ChartExBuilder
                 series.AppendChild(new CX.DataId { Val = (uint)si });
 
                 // Chart-type specific layoutPr (histogram binning, treemap label
-                // layout, boxWhisker stats, etc.)
-                var layoutPr = BuildLayoutProperties(normalized, properties, seriesData[si].values.Length);
-                if (layoutPr != null)
-                    series.AppendChild(layoutPr);
+                // layout, boxWhisker stats, etc.). Pareto's clusteredColumn
+                // series must NOT have binning — the data is categorical
+                // (strDim categories), not continuous numeric for histogram bins.
+                if (normalized != "pareto")
+                {
+                    var layoutPr = BuildLayoutProperties(normalized, properties, seriesData[si].values.Length);
+                    if (layoutPr != null)
+                        series.AppendChild(layoutPr);
+                }
+
+                // Pareto clusteredColumn series: explicit axisId binding to
+                // the primary value axis (id=1), matching MSO's structure.
+                if (normalized == "pareto")
+                {
+                    const string cxAxNs = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+                    var barAxisId = new OpenXmlUnknownElement("cx", "axisId", cxAxNs);
+                    barAxisId.SetAttribute(new OpenXmlAttribute("val", "", "1"));
+                    series.AppendChild(barAxisId);
+                }
 
                 plotAreaRegion.AppendChild(series);
         }
 
+        // Pareto: append the paretoLine overlay series (derives from series 0
+        // via ownerIdx="0", auto-computes cumulative %; bound to the secondary
+        // percentage axis id=2). Matches MSO's on-the-wire structure.
+        if (normalized == "pareto")
+        {
+            const string cxParetoNs = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+            var paretoLine = new CX.Series
+            {
+                LayoutId = new EnumValue<CX.SeriesLayout>(CX.SeriesLayout.ParetoLine),
+                OwnerIdx = 0,
+            };
+            var axisIdEl = new OpenXmlUnknownElement("cx", "axisId", cxParetoNs);
+            axisIdEl.SetAttribute(new OpenXmlAttribute("val", "", "2"));
+            paretoLine.AppendChild(axisIdEl);
+            plotAreaRegion.AppendChild(paretoLine);
+        }
+
         plotArea.AppendChild(plotAreaRegion);
 
-        // Axes for chart types that need them (histogram / boxWhisker).
-        // Funnel/treemap/sunburst are axis-less.
-        if (normalized is "boxwhisker" or "histogram")
+        // Axes for chart types that need them (histogram / boxWhisker / pareto).
+        // Funnel/treemap/sunburst are axis-less. Pareto gets 3 axes: cat(0),
+        // primary val(1) for bars, secondary percentage(2) for the cumulative line.
+        if (normalized is "boxwhisker" or "histogram" or "pareto")
         {
             plotArea.AppendChild(BuildCategoryAxis(id: 0, chartType: normalized, properties));
             plotArea.AppendChild(BuildValueAxis(id: 1, properties));
+
+            if (normalized == "pareto")
+            {
+                // Secondary percentage axis for the cumulative line (0-100%).
+                // Uses raw elements for cx:units since the SDK doesn't expose
+                // a typed CX.Units class.
+                const string cxAxisNs = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+                var pctAxis = new CX.Axis { Id = 2 };
+                pctAxis.AppendChild(new CX.ValueAxisScaling { Max = "1", Min = "0" });
+                var unitsEl = new OpenXmlUnknownElement("cx", "units", cxAxisNs);
+                unitsEl.SetAttribute(new OpenXmlAttribute("unit", "", "percentage"));
+                pctAxis.AppendChild(unitsEl);
+                pctAxis.AppendChild(new CX.TickLabels());
+                plotArea.AppendChild(pctAxis);
+            }
         }
 
         // Plot area fill / border — optional background styling
@@ -707,8 +761,11 @@ internal static partial class ChartExBuilder
     {
         var data = new CX.Data { Id = id };
 
-        // String dimension for categories (if provided)
-        if (categories != null && chartType is "funnel" or "treemap" or "sunburst" or "boxwhisker")
+        // String dimension for categories (if provided). Pareto is included
+        // because both of its series (clusteredColumn + paretoLine) share
+        // the same sorted category labels — unlike histogram which auto-bins
+        // numeric data and has no explicit categories.
+        if (categories != null && chartType is "funnel" or "treemap" or "sunburst" or "boxwhisker" or "pareto")
         {
             var strDim = new CX.StringDimension { Type = CX.StringDimensionType.Cat };
 
@@ -861,11 +918,21 @@ internal static partial class ChartExBuilder
 
     /// <summary>
     /// Detect if a cx:chartSpace contains an extended chart type and return the type name.
+    /// Also handles MSO-authored Pareto files which may contain both a clusteredColumn
+    /// and a paretoLine series — if any series has paretoLine layout, it's a pareto.
     /// </summary>
     internal static string? DetectExtendedChartType(CX.ChartSpace chartSpace)
     {
-        var series = chartSpace.Descendants<CX.Series>().FirstOrDefault();
-        var layoutId = series?.LayoutId?.InnerText;
+        var allSeries = chartSpace.Descendants<CX.Series>().ToList();
+        if (allSeries.Count == 0) return null;
+
+        // Pareto: any paretoLine series ⇒ the whole chart is a pareto.
+        // Handles both OfficeCli-authored (single paretoLine series) and
+        // MSO-authored (clusteredColumn + paretoLine pair) forms.
+        if (allSeries.Any(s => s.LayoutId?.InnerText == "paretoLine"))
+            return "pareto";
+
+        var layoutId = allSeries[0].LayoutId?.InnerText;
         if (layoutId == null) return null;
         return layoutId switch
         {
@@ -874,9 +941,49 @@ internal static partial class ChartExBuilder
             "sunburst" => "sunburst",
             "boxWhisker" => "boxWhisker",
             "clusteredColumn" => "histogram",
-            "paretoLine" => "pareto",
             "regionMap" => "regionMap",
             _ => layoutId
         };
+    }
+
+    /// <summary>
+    /// Transform a user's single-series Pareto input into the 2-series form
+    /// that Excel's cx:chart pareto uses internally. The first user series
+    /// is sorted descending (biggest first); cumulative percentages are
+    /// computed on the sorted order and returned as the second series.
+    /// If the user supplies multiple series, extras are silently ignored —
+    /// pareto is inherently univariate.
+    /// </summary>
+    /// <summary>
+    /// Pre-sort the user's single series descending for Pareto. Returns a
+    /// single series (the sorted values); the cumulative-% paretoLine
+    /// series is appended in BuildExtendedChartSpace via ownerIdx=0
+    /// (Excel auto-computes cumulative from the bar data).
+    /// </summary>
+    private static (string[]? categories, List<(string name, double[] values)> seriesData)
+        PreparePareto(string[]? categories, List<(string name, double[] values)> seriesData)
+    {
+        if (seriesData.Count == 0)
+            return (categories, seriesData);
+
+        var (srcName, srcValues) = seriesData[0];
+        int n = srcValues.Length;
+        if (n == 0)
+            return (categories, seriesData);
+
+        var cats = (categories != null && categories.Length == n)
+            ? categories
+            : Enumerable.Range(1, n).Select(i => i.ToString(CultureInfo.InvariantCulture)).ToArray();
+
+        // Sort by value descending; stable for equal values.
+        var indices = Enumerable.Range(0, n).OrderByDescending(i => srcValues[i]).ToArray();
+        var sortedCats = indices.Select(i => cats[i]).ToArray();
+        var sortedVals = indices.Select(i => srcValues[i]).ToArray();
+
+        var barsName = string.IsNullOrEmpty(srcName) ? "Value" : srcName;
+        return (sortedCats, new List<(string, double[])>
+        {
+            (barsName, sortedVals),
+        });
     }
 }

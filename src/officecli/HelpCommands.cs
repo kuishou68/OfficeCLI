@@ -916,7 +916,12 @@ Sheet properties (/SheetName):
   fitToPage      true/false — fit content to page when printing
   header         Print header text
   footer         Print footer text
-  sort           Sort range and column (e.g. "A1:D10,B" or "A1:D10,B,desc")
+  sort           Sort spec: "COL DIR[, COL DIR ...]" — space-separated column
+                 and direction, comma-separated for multi-key.
+                 DIR is asc or desc (optional, defaults to asc).
+                 Examples: --prop sort="Salary desc"
+                           --prop sort="Dept asc, Salary desc"
+                 Combine with --prop sortHeader=true to treat row 1 as header.
   sortHeader     true/false — treat the first row of the sort range as a header
                  (excluded from the reorder). Used together with sort.
 

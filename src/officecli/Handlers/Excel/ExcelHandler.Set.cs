@@ -1868,15 +1868,20 @@ public partial class ExcelHandler
                 // sync. See CLAUDE.md "Consistency > Robustness".
                 case "sort":
                 {
-                    ws.GetFirstChild<SortState>()?.Remove();
+                    // R7-3: remove ALL sortState children (malformed files may
+                    // carry more than one; GetFirstChild leaves stragglers).
+                    foreach (var __ss in ws.Descendants<SortState>().ToList()) __ss.Remove();
                     if (string.IsNullOrEmpty(value) || value.Equals("none", StringComparison.OrdinalIgnoreCase))
                         break;
 
                     var sd = ws.GetFirstChild<SheetData>();
-                    if (sd == null) break;
+                    if (sd == null) sd = ws.AppendChild(new SheetData());
                     var rows = sd.Elements<Row>().ToList();
-                    if (rows.Count == 0) break;
-
+                    // R12-2: DO NOT early-return on empty sheet here. Empty sheet + invalid
+                    // sort spec (e.g. "XFE asc", "AAAA asc", "sort=asc") used to silently
+                    // succeed because we bailed before spec validation. Always dispatch into
+                    // SortRangeRows so it validates the spec first; if spec is valid and there
+                    // is no data, it no-ops cleanly via its existing dataStartRow > row2 guard.
                     int maxCol = 1;
                     foreach (var r in rows)
                         foreach (var c in r.Elements<Cell>())
@@ -1885,11 +1890,21 @@ public partial class ExcelHandler
                             if (cref == null) continue;
                             maxCol = Math.Max(maxCol, ColumnNameToIndex(ParseCellReference(cref).Column));
                         }
-                    int minRowIdx = (int)rows.Min(r => r.RowIndex?.Value ?? 1u);
-                    int maxRowIdx = (int)rows.Max(r => r.RowIndex?.Value ?? 1u);
+                    int minRowIdx = rows.Count == 0 ? 1 : (int)rows.Min(r => r.RowIndex?.Value ?? 1u);
+                    int maxRowIdx = rows.Count == 0 ? 1 : (int)rows.Max(r => r.RowIndex?.Value ?? 1u);
 
+                    // CONSISTENCY(sort-header-default): sortHeader defaults to false
+                    // (row 1 participates in the reorder). This matches our general
+                    // "caller states intent explicitly" rule and is documented in help.
+                    // R4-D1 and R7-4 both proposed auto-detecting headers (type-mismatch
+                    // heuristic, first-row-is-string warning). Rejected: heuristic
+                    // warnings ship false positives on legitimately-heterogeneous
+                    // row-1 data and are spammy in pipelines. Future revisit: make
+                    // sortHeader default=true project-wide as a breaking change,
+                    // documented in release notes — do NOT add a per-call warning.
                     bool sortHeader = properties.TryGetValue("sortheader", out var shv) && IsTruthy(shv);
                     SortRangeRows(worksheet, 1, minRowIdx, maxCol, maxRowIdx, value, sortHeader);
+                    DeleteCalcChainIfPresent();
                     break;
                 }
                 case "sortheader":
@@ -2070,7 +2085,9 @@ public partial class ExcelHandler
             throw new ArgumentException("sort value cannot be empty");
         if (sortSpec.Equals("none", StringComparison.OrdinalIgnoreCase))
         {
-            GetSheet(worksheet).GetFirstChild<SortState>()?.Remove();
+            // R7-3: drop every SortState, not just the first.
+            var __ws0 = GetSheet(worksheet);
+            foreach (var __ss in __ws0.Descendants<SortState>().ToList()) __ss.Remove();
             return;
         }
 
@@ -2155,10 +2172,27 @@ public partial class ExcelHandler
             if (!Regex.IsMatch(colName, @"^[A-Z]+$"))
                 throw new ArgumentException(
                     $"Invalid sort column '{tokens[0]}'. Expected column letters (A, B, AA). Column names are not supported; use letters.");
+            // R12-3: "asc" and "desc" are direction keywords, not column letters. When a
+            // user writes `sort=asc` (forgot the column) the token parses as a column
+            // name and produced a misleading "outside the range" error. Reject up-front
+            // with a targeted message. Applies regardless of case (Regex above already
+            // upper-cased via ToUpperInvariant, so match against "ASC"/"DESC").
+            if (colName == "ASC" || colName == "DESC")
+                throw new ArgumentException(
+                    $"Invalid sort key '{spec.Trim()}': sort key must start with a column letter, not a direction keyword ('{tokens[0]}'). Expected '<col> [asc|desc]'.");
             bool desc = tokens.Length > 1 && tokens[1].Equals("desc", StringComparison.OrdinalIgnoreCase);
             if (tokens.Length > 1 && !desc && !tokens[1].Equals("asc", StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException($"Invalid sort direction '{tokens[1]}'. Expected 'asc' or 'desc'.");
             int keyColIdx = ColumnNameToIndex(colName);
+            // R11-1 / R12-2: Excel's max column is XFD (16384, 3 letters). Anything
+            // that parses past XFD is an invalid column:
+            //   - length >= 4 (e.g. "AAAA", "Score"): almost certainly a column name
+            //   - length == 3 but > XFD (e.g. "XFE", "ZZZ"): out of Excel's column space
+            // Both cases used to fall through to a misleading "outside the range A:B"
+            // error (especially pronounced on empty sheets where the range is A:A).
+            if (keyColIdx > 16384)
+                throw new ArgumentException(
+                    $"Invalid sort column '{tokens[0]}'. Column names are not supported; use column letters (A, B, AA, up to XFD).");
             // Key column must lie within the sort range, otherwise the sort is silently
             // a no-op and writes a malformed sortCondition ref.
             if (keyColIdx < col1 || keyColIdx > col2)
@@ -2169,9 +2203,12 @@ public partial class ExcelHandler
         if (sortKeys.Count == 0) return;
 
         int dataStartRow = sortHeader ? row1 + 1 : row1;
+        // R6-2: a sort that can't reorder anything (empty data region, or a
+        // single data row) is a no-op. Writing sortState in those cases makes
+        // Excel render a bogus sort indicator on a range that was never sorted.
+        // Skip the metadata entirely rather than lying about having sorted.
         if (dataStartRow > row2)
         {
-            WriteSortState(ws, col1, row1, col2, row2, sortKeys);
             return;
         }
 
@@ -2180,7 +2217,6 @@ public partial class ExcelHandler
             .ToList();
         if (rowsInRange.Count <= 1)
         {
-            WriteSortState(ws, col1, row1, col2, row2, sortKeys);
             return;
         }
 
@@ -2250,11 +2286,15 @@ public partial class ExcelHandler
             {
                 ordered = ordered.ThenBy(x => x.Keys[idx].Rank);
             }
+            // R7-1: use case-insensitive comparer to match Excel's default sort
+            // behavior. sortState defaults caseSensitive=false, so the physical
+            // order must agree with that metadata declaration. Swapping to
+            // OrdinalIgnoreCase also matches Excel's user-visible default.
             ordered = desc
                 ? ordered.ThenByDescending(x => x.Keys[idx].NumVal)
-                         .ThenByDescending(x => x.Keys[idx].StrVal, StringComparer.Ordinal)
+                         .ThenByDescending(x => x.Keys[idx].StrVal, StringComparer.OrdinalIgnoreCase)
                 : ordered.ThenBy(x => x.Keys[idx].NumVal)
-                         .ThenBy(x => x.Keys[idx].StrVal, StringComparer.Ordinal);
+                         .ThenBy(x => x.Keys[idx].StrVal, StringComparer.OrdinalIgnoreCase);
         }
         var sortedRows = ordered!.Select(x => x.Row).ToList();
 
@@ -2322,7 +2362,10 @@ public partial class ExcelHandler
     private static void WriteSortState(Worksheet ws, int col1, int row1, int col2, int row2,
         List<(int ColIndex, bool Descending)> sortKeys)
     {
-        ws.GetFirstChild<SortState>()?.Remove();
+        // R7-3: drop every SortState, not just the first (malformed files may
+        // carry duplicates). GetFirstChild would leave the tail behind and the
+        // newly-appended state would become the 2nd/3rd, still ambiguous.
+        foreach (var __ss in ws.Descendants<SortState>().ToList()) __ss.Remove();
         var fullRef = $"{IndexToColumnName(col1)}{row1}:{IndexToColumnName(col2)}{row2}";
         var ss = new SortState { Reference = fullRef };
         foreach (var (colIdx, desc) in sortKeys)
@@ -2472,6 +2515,128 @@ public partial class ExcelHandler
                         tokens.Select(t => new StringValue(t)));
                 }
             }
+        }
+
+        // ---- ProtectedRanges (R7-2) ----
+        // CONSISTENCY(sort-scope): same cell-anchored scoping as dataValidations.
+        // Each <protectedRange sqref="..."> carries a space-separated list of
+        // ref tokens; only single-cell tokens inside the sort rectangle are
+        // remapped. Multi-cell ranges are left intact (partial-rect split would
+        // alter which cells are protected, same philosophy as DV/CF).
+        var pranges = ws.GetFirstChild<ProtectedRanges>();
+        if (pranges != null)
+        {
+            foreach (var pr in pranges.Elements<ProtectedRange>())
+            {
+                var sqref = pr.SequenceOfReferences;
+                if (sqref?.InnerText == null) continue;
+                var tokens = sqref.InnerText.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                bool changed = false;
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    var tok = tokens[i];
+                    if (tok.Contains(':')) continue; // range token — skip
+                    if (CellInRect(tok, out var pc, out var pRow) && oldToNewRow.TryGetValue(pRow, out var newR))
+                    {
+                        tokens[i] = $"{pc.ToUpperInvariant()}{newR}";
+                        changed = true;
+                    }
+                }
+                if (changed)
+                {
+                    pr.SequenceOfReferences = new ListValue<StringValue>(
+                        tokens.Select(t => new StringValue(t)));
+                }
+            }
+        }
+
+        // ---- ConditionalFormatting (R6-1) ----
+        // CONSISTENCY(sort-scope): same cell-anchored scoping as dataValidations.
+        // CF sqref is a space-separated list where each token may be a single
+        // cell (A2) or a range (A1:A10). Only single-cell tokens inside the sort
+        // rectangle are remapped; multi-cell ranges are left untouched — a range
+        // that straddles reordered rows cannot be split into the new set of rows
+        // without changing which cells the rule covers, so we preserve the
+        // authored range verbatim (same partial-rect rule as dataValidations).
+        foreach (var cf in ws.Elements<ConditionalFormatting>())
+        {
+            var sqref = cf.SequenceOfReferences;
+            if (sqref?.InnerText == null) continue;
+            var tokens = sqref.InnerText.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            bool changed = false;
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                var tok = tokens[i];
+                if (tok.Contains(':')) continue; // range token — skip
+                if (CellInRect(tok, out var cc, out var cr) && oldToNewRow.TryGetValue(cr, out var newR))
+                {
+                    tokens[i] = $"{cc.ToUpperInvariant()}{newR}";
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                cf.SequenceOfReferences = new ListValue<StringValue>(
+                    tokens.Select(t => new StringValue(t)));
+            }
+        }
+
+        // ---- Drawing anchors (R6-4) ----
+        // CONSISTENCY(sort-scope): same cell-anchored scoping as dataValidations/CF.
+        // Drawing anchors (xdr:twoCellAnchor/xdr:oneCellAnchor) pin shapes, pictures,
+        // and charts to a (col,row) pair via xdr:from (and xdr:to for twoCell). RowId
+        // is 0-indexed in OOXML, so worksheet row N ↔ RowId = N-1. Before R6-4 the
+        // sort path rewrote cell-level sidecars but left drawing RowIds untouched,
+        // which dragged pictures off their original anchor row after a reorder.
+        //
+        // Scoping rule (partial-rect): for TwoCellAnchor both From and To rows must
+        // fall inside the sort rectangle for the anchor to move. If only one end is
+        // inside, preserve the authored anchor (splitting a rectangle across
+        // reordered rows would change which cells the drawing visually covers).
+        // OneCellAnchor has only From — remap iff From is inside.
+        // Columns aren't affected by row sort, so ColId is never rewritten.
+        var drawingsPart = worksheet.DrawingsPart;
+        if (drawingsPart?.WorksheetDrawing != null)
+        {
+            bool drawingChanged = false;
+            bool RowInSortRect(uint oneBasedRow) =>
+                oneBasedRow >= (uint)row1 && oneBasedRow <= (uint)row2;
+
+            // TwoCellAnchor: remap only if both endpoints' rows are in sort rect.
+            foreach (var anchor in drawingsPart.WorksheetDrawing.Elements<XDR.TwoCellAnchor>())
+            {
+                var from = anchor.FromMarker;
+                var to = anchor.ToMarker;
+                if (from?.RowId?.Text == null || to?.RowId?.Text == null) continue;
+                if (!uint.TryParse(from.RowId.Text, out uint fromRow0)) continue;
+                if (!uint.TryParse(to.RowId.Text, out uint toRow0)) continue;
+                uint fromRow1 = fromRow0 + 1;
+                uint toRow1 = toRow0 + 1;
+                if (!RowInSortRect(fromRow1) || !RowInSortRect(toRow1)) continue;
+                if (!oldToNewRow.TryGetValue(fromRow1, out uint newFrom1)) continue;
+                if (!oldToNewRow.TryGetValue(toRow1, out uint newTo1)) continue;
+                from.RowId = new DocumentFormat.OpenXml.Drawing.Spreadsheet.RowId(
+                    (newFrom1 - 1).ToString());
+                to.RowId = new DocumentFormat.OpenXml.Drawing.Spreadsheet.RowId(
+                    (newTo1 - 1).ToString());
+                drawingChanged = true;
+            }
+
+            // OneCellAnchor: remap iff From is in sort rect.
+            foreach (var anchor in drawingsPart.WorksheetDrawing.Elements<XDR.OneCellAnchor>())
+            {
+                var from = anchor.FromMarker;
+                if (from?.RowId?.Text == null) continue;
+                if (!uint.TryParse(from.RowId.Text, out uint fromRow0)) continue;
+                uint fromRow1 = fromRow0 + 1;
+                if (!RowInSortRect(fromRow1)) continue;
+                if (!oldToNewRow.TryGetValue(fromRow1, out uint newFrom1)) continue;
+                from.RowId = new DocumentFormat.OpenXml.Drawing.Spreadsheet.RowId(
+                    (newFrom1 - 1).ToString());
+                drawingChanged = true;
+            }
+
+            if (drawingChanged) drawingsPart.WorksheetDrawing.Save();
         }
     }
 
