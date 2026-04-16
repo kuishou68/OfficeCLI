@@ -56,15 +56,19 @@
 
 ---
 
-### 2. 清理 tracked patch 自动生成的批注（"校对修订"）
+### 2. 清理 tracked patch 自动生成的批注（"校对修订" / "校对删除"）
 
-- **What**：`OpKind::Patch` 调用 `set --prop tracked=true` 成功后，立即 query 并删除 OfficeCLI 自动附带的批注（identified by `author=Cove` + anchoredTo target + text 前缀 `"校对修订"`）
-- **Why**：OfficeCLI v1.0.43+ 在执行 `set --prop tracked=true` 时无条件创建一条批注（text 形如 `"校对修订：\"旧\" → \"新\""`），且没有选项关闭。尝试过 `addComment=false` / `withComment=false` / `revisionComment=false` / `comment=false` / `trackComment=false` / `noComment=true` 全部被忽略
-- **Solves**：`校对-修订` 快捷指令场景下，用户只要修订标记（w:del + w:ins），不要批注气泡。否则每次校对都在审阅面板产生一大堆 "校对修订：..." 批注干扰
+- **What**：`OpKind::Patch` 走 `tracked=true` 成功后，立即 query 并删除 OfficeCLI 自动附带的 synthetic comments。兼容 legacy 单条执行和 batch 执行两条链路；识别条件为 `author=Cove` + `anchoredTo` 命中当前 patch 段落 + text 前缀 `"校对修订"` 或 `"校对删除"`
+- **Why**：OfficeCLI v1.0.43+ 在执行 `set --prop tracked=true` 时无条件创建一条批注（text 形如 `"校对修订：\"旧\" → \"新\""` 或 `"校对删除：\"旧\""`），且没有选项关闭。尝试过 `addComment=false` / `withComment=false` / `revisionComment=false` / `comment=false` / `trackComment=false` / `noComment=true` 全部被忽略
+- **Solves**：
+  - `校对-修订` 结果只保留真正的 revision marks（`w:del + w:ins`），不再把 synthetic comments 一起写进 `.docx`
+  - Cove 的 OfficeCLI HTML 预览不再出现 ①②③ comment side panel / 旁注气泡
+  - Word / WPS 审阅面板不再被一堆 `"校对修订：..."` / `"校对删除：..."` 噪音批注污染
 - **Location**：
-  - `adapter.rs:499-505` `OpKind::Patch` 分支调用点
-  - `adapter.rs:449-487` `cleanup_tracked_patch_comment` helper
-- **Added**：2026-04-14（本次）
+  - `adapter.rs` `cleanup_tracked_patch_comments` / `collect_auto_tracked_patch_comment_paths`
+  - `adapter.rs` `execute_ops_batch`
+  - `adapter.rs` `execute_op`
+- **Added**：2026-04-16（本次修复恢复启用）
 - **Upstream note**：应向 OfficeCLI 提 issue 请求增加 `trackComment=false` 选项。届时可删除 helper 并改传该 prop
 
 ---
