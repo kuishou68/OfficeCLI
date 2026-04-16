@@ -129,6 +129,127 @@
   - HTML 预览对“无显式 spacing 的段落”会更积极输出 inline `line-height`，可能改变少量历史文档的旧预览截图
   - 改动只影响 `view ... html` 预览层，不影响 DOCX 写回
 
+### 7. HTML 预览按缩进继承链和 style-only 段落修正边距/行高
+
+- **What**：继续修改 `WordHandler.HtmlPreview.Css.cs`：
+  - `ResolveIndentationFromStyle` 改为按属性级别合并 `w:style` basedOn 链和 `docDefaults` 的 `w:ind`
+  - `ResolveParagraphStyleCss` 不再直接把样式里的 `spacing.Line/240` 塞进 CSS，而是复用 `BuildDefaultParagraphLineHeightCss` 的字体 metrics 路径
+- **Why**：
+  - 旧实现对缩进继承仍是“遇到第一个 `<w:ind>` 就整块返回”；如果派生样式只覆写 `firstLine`，而 `left/right` 仍在基样式，预览会丢掉段落左右边距
+  - 对没有直接 `pPr` 的段落，样式链里的 `line` 之前按裸 `240` 倍率输出，没有乘上 EastAsia 字体 metrics，修订/正文混排时会比 WPS 更松或更紧
+- **Solves**：
+  - WPS / Word 中依赖样式继承的首行缩进、左右边距，在 cove-desktop 预览里更接近原始 DOCX
+  - 修订段落和普通段落混排时，style-only 段落的行高不再和带直接 `pPr` 的段落走两套算法
+- **Location**：
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.Css.cs`
+  - `ResolveIndentationFromStyle`
+  - `ResolveParagraphStyleCss`
+- **Added**：2026-04-15
+- **Risk**：
+  - 仅影响 `view ... html` 预览层；历史截图或像素基准可能会小幅变化
+  - 如果某些文档依赖“错误的首个 `<w:ind>` 短路行为”，预览边距会发生校正
+
+---
+
+### 8. `TryResident(...)` 支持 `OFFICECLI_SKIP_RESIDENT=1`
+
+- **What**：修改 `src/officecli/CommandBuilder.cs` 的 `TryResident(...)`：当环境变量 `OFFICECLI_SKIP_RESIDENT=1/true` 时，直接返回 `null`，完全跳过 resident 探测、复用和 auto-start
+- **Why**：
+  - cove-desktop 的读命令链路需要一个“本次显式不要 resident”的强开关。现有 `OFFICECLI_NO_AUTO_RESIDENT` 只影响“没 resident 时是否 auto-start”，对“已经存在但状态不健康的 resident”无效
+  - 这类坏 resident 即使不再持有文件锁，也会让 `query/view` 先走进 `TryResident(...)`，再卡在 main pipe busy timeout，最终把一次本可亚秒完成的读命令放大到 30s~60s
+- **Solves**：
+  - 让 cove-desktop 的 `query/view/get/raw` 可以稳定走 direct file access，彻底绕开 existing resident 的不确定性
+  - 保留 OfficeCLI resident 机制给真正受益的写命令；只读链路由调用方按需 opt-out
+- **Location**：`src/officecli/CommandBuilder.cs` `TryResident`
+- **Added**：2026-04-15
+- **Risk**：
+  - 新增 opt-in 环境变量，不影响默认 CLI 用户
+  - 调用方如果误把该变量用于写命令，会失去 resident 带来的性能/一致性保障；因此当前只供 cove-desktop 的读链路使用
+
+---
+
+### 9. HTML 预览分页模板补齐页眉/页脚，并显式解析 `PAGE/NUMPAGES`
+
+- **What**：
+  - `WordHandler.HtmlPreview.Text.cs` 对页眉/页脚中的 complex field / simple field 显式识别 `PAGE`、`NUMPAGES`、`SECTIONPAGES`，输出 `<span class="page-num">` / `<span class="page-count">` 占位符，而不再依赖 Word 预先写回缓存结果
+  - `WordHandler.HtmlPreview.cs` 生成分页模板时，为首/奇/偶页同时保留 header/footer 模板；客户端自动分页时复制 header 和 footer；重新分页后统一回填当前页码和总页数
+  - `NormalizeStandalonePageBreakParagraphs` 和 body 渲染路径继续配合，确保 standalone `w:br w:type="page"` 不再把 `<p>` 起止标签切到两页
+  - 在嵌入式 iframe 预览场景下禁用 `scalePages()` 自动缩放，只保留分页，避免首屏先按自然页宽渲染、随后再被缩窄
+- **Why**：
+  - 上游 HTML 预览对 header/footer 里的 field code 基本依赖“结果 run 已经存在”。很多文档里 `PAGE/NUMPAGES` 只有指令，没有缓存数字，结果页脚渲染成“第  页 共  页”
+  - 自动分页新增页面时，上游只复制 footer 模板或根本没有结构化页码占位符，导致长文档预览中页眉页脚缺失、页码不更新
+  - standalone page break 段落如果仍被包在 `<p>` 里，分页切割后会形成跨页悬空标签，直接扰乱第一页布局和后续 DOM 结构
+- **Solves**：
+  - Cove 长文档预览里，每一页都能继承正确的页眉/页脚模板
+  - `PAGE/NUMPAGES` 不再依赖 Word 先更新字段，HTML 预览中可直接显示并在自动分页后保持正确
+  - 手动分页符附近不再出现“上一页开 `<p>`、下一页补 `</p>`”的畸形 HTML，减少第一页白底结构异常
+  - cove-desktop 里 `srcdoc + iframe` 打开的长文档不会在几秒后再发生一次整页缩窄的视觉跳变
+- **Location**：
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.Text.cs`
+  - `src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs`
+- **Added**：2026-04-15，commit `pending`
+- **Risk**：
+  - 仅影响 `view ... html` 预览层，不影响 DOCX 写回
+  - header/footer 中极少数非页码 field 仍走原有“显示缓存结果”路径；当前只对 cove-desktop 需要的分页字段做结构化处理
+
+---
+
+### 10. HTML 预览恢复 `w:jc` 对齐映射，避免标题和页眉页脚退回默认对齐
+
+- **What**：修改 `WordHandler.HtmlPreview.Css.cs` 的段落对齐解析：`GetParagraphInlineCss` / `ResolveParagraphStyleCss` 不再依赖 `EnumValue<JustificationValues>.Value`，改为直接消费 OOXML 原始 `w:jc/@w:val` 文本（`Val.InnerText`）映射 CSS `text-align`
+- **Why**：
+  - 近期把 `jc.InnerText switch` 收敛成 enum helper 时，部分真实 DOCX 的 `EnumValue.Value` 没有稳定落到预期值，导致 direct paragraph properties 里的 `center/right` 被吃掉
+  - 这个回归在封面标题、页眉、页脚里最明显：原本居中/右对齐的内容会退回页面默认 `justify/left`
+- **Solves**：
+  - Cove 预览中的封面标题、副标题重新与 WPS / Word 保持居中
+  - 页眉右对齐、页脚居中页码恢复正确，不再看起来像“页边距对了但版心没对齐”
+  - 保留 style-chain fallback，同时避免 enum 解析差异再次引入视觉漂移
+- **Location**：`src/officecli/Handlers/Word/WordHandler.HtmlPreview.Css.cs`
+- **Added**：2026-04-15，commit `pending`
+- **Risk**：
+  - 仅影响 `view ... html` 预览层，不影响 DOCX 写回
+  - 对齐映射回到 OOXML 原始值后，少数依赖错误默认对齐的旧截图会发生校正
+
+---
+
+### 11. HTML 预览按页面边缘定位页眉页脚，并把 `docGrid linePitch` 压到段落行高
+
+- **What**：继续修改 `WordHandler.HtmlPreview.Css.cs`：
+  - `GenerateWordCss` 中 `.doc-header` / `.doc-footer` 改为以“页面边缘”为基准计算 `top/bottom`，并用 `padding-left/right` 承接页边距，而不是直接把 `header/footer distance` 当成内容区内偏移
+  - `BuildDefaultParagraphLineHeightCss` 改为按“段落实际字号 × OOXML 行距倍率 × 字体 metrics”算出绝对 pt 行高，并在 body 段落里用 section `w:docGrid/@w:linePitch` 做下限夹紧
+  - 新增 `ResolveParaFontSizePt` / `ClampBodyParagraphToDocGrid`，避免 `<p>` inline `line-height` 把全局 page grid 覆盖掉
+- **Why**：
+  - OOXML 的 `w:pgMar/@header`、`@footer` 是“距纸张边缘”的距离；旧 CSS 却在已经带 `padding` 的 `.page` 内容区里再加一遍偏移，页眉页脚会整体偏下、偏窄，看起来和 WPS/Word 的版心不一致
+  - 旧实现虽然在 `.page` 上写了 `docGrid linePitch`，但段落和 `<p>` 默认样式随后又各自输出了更小的 `line-height`，实际浏览器渲染时网格被覆盖，正文比 WPS 更紧
+  - WPS 导出的 `w:docGrid` 经常只写 `linePitch` 不写 `type`；如果解析层把“无 type”当成“无 grid”，正文会整体退回 10pt/11pt 级浏览器默认行距
+- **Solves**：
+  - 页眉/页脚的横向版心重新与页面边距对齐，纵向位置也回到 `header/footer distance` 的真实位置
+  - 带 `w:docGrid linePitch` 的中文 DOCX，正文基线间距不再掉回浏览器默认单倍行距，预览松紧更接近 WPS / Word
+  - 标题等大字号段落仍保留自身更高的行高，不会被 18pt grid 反向压扁
+- **Location**：`src/officecli/Handlers/Word/WordHandler.HtmlPreview.Css.cs`
+- **Added**：2026-04-15，commit `pending`
+- **Risk**：
+  - 仅影响 `view ... html` 预览层，不影响 DOCX 写回
+  - 历史截图或像素基准会因为页眉页脚和正文行距更接近真实版式而发生变化
+
+---
+
+### 12. 字体 metrics 查找补齐 macOS CJK 别名，避免 `宋体/黑体` 行高退回 1.0
+
+- **What**：修改 `src/officecli/Core/FontMetricsReader.cs` 的 `FindFontFile`：不再只按文件 stem 精确匹配传入的字体名，而是先展开一层 CJK 逻辑字体别名，再按归一化后的候选名匹配本机字体文件。新增 `宋体 -> Songti/Songti SC/STSong`、`黑体 -> STHeiti/Heiti SC`、`仿宋_GB2312 -> STFangsong/FangSong`、`楷体_GB2312 -> STKaiti/KaiTi` 等映射
+- **Why**：
+  - DOCX 经常写的是 Windows 逻辑字体名（如 `宋体`、`黑体`），但 macOS 实际字体文件名是 `Songti.ttc`、`STHeiti.ttc`
+  - 旧实现只按文件 stem 精确匹配，`FontMetricsReader.GetRatio("宋体")` 在 mac 上通常直接 miss，退回 `1.0`
+  - 一旦 metrics miss，HTML 预览虽然已经输出了绝对 pt 行高，数值仍然是按“无额外 ascent/descent”计算，中文段落会比浏览器实际使用的 `Songti SC` / `Heiti SC` 行框更紧
+- **Solves**：
+  - Cove 预览里 `宋体/黑体/仿宋/楷体` 中文段落的行高计算更接近 macOS 实际渲染字体，不再因为逻辑字体名 miss 而压扁
+  - `BuildDefaultParagraphLineHeightCss` / `GenerateWordCss` 的 metrics 路径终于能命中 `Songti.ttc`、`STHeiti.ttc` 这类系统字体文件
+- **Location**：`src/officecli/Core/FontMetricsReader.cs`
+- **Added**：2026-04-16，commit `pending`
+- **Risk**：
+  - 仅影响依赖 `GetRatio()` / `GetAscentDescentOverride()` 的 HTML 预览层，不影响 DOCX 写回
+  - 历史预览截图会因行高更接近系统真实字体而发生校正；CLI 其他 consumers 若依赖旧的 `1.0` fallback，视觉会同步变更
+
 ---
 
 ## 流程

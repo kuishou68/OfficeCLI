@@ -24,6 +24,15 @@ public partial class WordHandler
 
     private void RenderParagraphHtml(StringBuilder sb, Paragraph para)
     {
+        // Keep standalone manual page-break paragraphs out of surrounding <p>
+        // tags so page splitting does not leave dangling open/close tags across
+        // page boundaries.
+        if (IsStandalonePageBreakParagraph(para))
+        {
+            sb.AppendLine("<!--PAGE_BREAK-->");
+            return;
+        }
+
         // Use <div> instead of <p> when paragraph contains block-level elements (text boxes, charts, shapes)
         var tag = HasBlockLevelDrawing(para) ? "div" : "p";
         sb.Append($"<{tag}");
@@ -42,6 +51,8 @@ public partial class WordHandler
     private void RenderParagraphContentHtml(StringBuilder sb, Paragraph para)
     {
         OnHtmlParagraphBegin(para);
+        if (_ctx.RenderingHeaderFooter)
+            _ctx.ResetHeaderFooterFieldState();
 
         // MOD(#5): Reopen comment marks that span from previous paragraphs
         foreach (var cmId in _ctx.OpenCommentMarks)
@@ -195,10 +206,12 @@ public partial class WordHandler
                 foreach (var innerRun in child.Descendants<Run>())
                     RenderRunHtml(sb, innerRun, para);
             }
-            else if (child.LocalName == "fldSimple")
+            else if (child is SimpleField simpleField)
             {
+                if (TryRenderHeaderFooterSimpleField(sb, simpleField, para))
+                    continue;
                 // Simple field codes (page numbers, cross-refs) — render cached display text
-                foreach (var fldRun in child.Elements<Run>())
+                foreach (var fldRun in simpleField.Elements<Run>())
                     RenderRunHtml(sb, fldRun, para);
             }
         }
@@ -207,7 +220,32 @@ public partial class WordHandler
         for (int i = _ctx.OpenCommentMarks.Count - 1; i >= 0; i--)
             sb.Append("</mark>");
 
+        if (_ctx.RenderingHeaderFooter)
+            _ctx.ResetHeaderFooterFieldState();
         OnHtmlParagraphEnd(sb);
+    }
+
+    private static bool IsStandalonePageBreakParagraph(Paragraph para)
+    {
+        var hasPageBreak = para.Descendants()
+            .Any(el =>
+                el.LocalName == "br"
+                && el.GetAttributes().Any(attr =>
+                    attr.LocalName == "type"
+                    && attr.Value == "page"));
+        if (!hasPageBreak) return false;
+
+        return !para.Descendants<Text>().Any(t => !string.IsNullOrEmpty(t.Text))
+            && !para.Descendants<DeletedText>().Any(t => !string.IsNullOrEmpty(t.Text))
+            && !para.Descendants<TabChar>().Any()
+            && !para.Descendants<CarriageReturn>().Any()
+            && !para.Descendants<SymbolChar>().Any()
+            && !para.Descendants<Drawing>().Any()
+            && !para.Descendants<EmbeddedObject>().Any()
+            && !para.Descendants<FootnoteReference>().Any()
+            && !para.Descendants<EndnoteReference>().Any()
+            && !para.Descendants<Hyperlink>().Any()
+            && !para.ChildElements.Any(child => child.LocalName == "oMath" || child is M.OfficeMath);
     }
 
     // ==================== Run Rendering ====================
@@ -231,6 +269,9 @@ public partial class WordHandler
             RenderOlePreviewHtml(sb, oleObject);
             return;
         }
+
+        if (TryRenderHeaderFooterFieldRun(sb, run, para))
+            return;
 
         // Footnote/endnote reference — render superscript number (don't return, run may also have text)
         var fnRef = run.GetFirstChild<FootnoteReference>();
@@ -346,6 +387,73 @@ public partial class WordHandler
 
         if (needsSpan && !_ctx.LineBreakEnabled)
             sb.Append("</span>");
+    }
+
+    private bool TryRenderHeaderFooterSimpleField(StringBuilder sb, SimpleField simpleField, Paragraph para)
+    {
+        if (!_ctx.RenderingHeaderFooter) return false;
+
+        var fieldType = ParseHeaderFooterFieldType(simpleField.Instruction?.Value);
+        if (string.IsNullOrEmpty(fieldType)) return false;
+
+        AppendHeaderFooterFieldHtml(sb, simpleField.Elements<Run>().FirstOrDefault(), para, fieldType);
+        return true;
+    }
+
+    private bool TryRenderHeaderFooterFieldRun(StringBuilder sb, Run run, Paragraph para)
+    {
+        if (!_ctx.RenderingHeaderFooter) return false;
+
+        var fldChar = run.GetFirstChild<FieldChar>();
+        if (fldChar != null)
+        {
+            var fieldCharType = fldChar.FieldCharType?.Value;
+            if (fieldCharType == FieldCharValues.Begin)
+            {
+                _ctx.ResetHeaderFooterFieldState();
+                return true;
+            }
+
+            if (fieldCharType == FieldCharValues.Separate)
+            {
+                if (!string.IsNullOrEmpty(_ctx.ActiveHeaderFooterField))
+                {
+                    AppendHeaderFooterFieldHtml(sb, run, para, _ctx.ActiveHeaderFooterField);
+                    _ctx.SkipHeaderFooterFieldResult = true;
+                }
+                return true;
+            }
+
+            if (fieldCharType == FieldCharValues.End)
+            {
+                _ctx.ResetHeaderFooterFieldState();
+                return true;
+            }
+
+            return true;
+        }
+
+        var fieldCode = run.GetFirstChild<FieldCode>();
+        if (fieldCode != null)
+        {
+            _ctx.ActiveHeaderFooterField = ParseHeaderFooterFieldType(fieldCode.Text);
+            return true;
+        }
+
+        return _ctx.SkipHeaderFooterFieldResult;
+    }
+
+    private void AppendHeaderFooterFieldHtml(StringBuilder sb, Run? run, Paragraph para, string fieldType)
+    {
+        var placeholder = GetHeaderFooterFieldPlaceholder(fieldType);
+        if (string.IsNullOrEmpty(placeholder)) return;
+
+        var rProps = run != null ? ResolveEffectiveRunProperties(run, para) : null;
+        var style = GetRunInlineCss(rProps);
+        if (!string.IsNullOrEmpty(style))
+            sb.Append($"<span style=\"{style}\">{placeholder}</span>");
+        else
+            sb.Append(placeholder);
     }
 
     // ==================== OLE Object Preview Rendering ====================

@@ -23,6 +23,9 @@ public partial class WordHandler
         public List<(string markerId, string imgHtml)> TopAnchoredImages { get; } = new();
         public PageLayout? CachedPageLayout { get; set; }
         public bool RenderingBody { get; set; }
+        public bool RenderingHeaderFooter { get; set; }
+        public string? ActiveHeaderFooterField { get; set; }
+        public bool SkipHeaderFooterFieldResult { get; set; }
 
         // MOD(#5): Comment annotation tracking
         public List<string> OpenCommentMarks { get; } = new(); // stack of open comment mark IDs
@@ -47,6 +50,12 @@ public partial class WordHandler
             LineWidthPt = contentWidthPt;
             LineAccumPt = 0;
         }
+
+        public void ResetHeaderFooterFieldState()
+        {
+            ActiveHeaderFooterField = null;
+            SkipHeaderFooterFieldResult = false;
+        }
     }
 
     /// <summary>Current render context — set during ViewAsHtml, used by all render methods.</summary>
@@ -57,6 +66,21 @@ public partial class WordHandler
 
     /// <summary>CJK font resolved from theme's supplemental font list (e.g. "Microsoft YaHei" for Hans).</summary>
     private string? _themeCjkFont;
+
+    private sealed record PreviewPageTemplates(
+        string FirstHeaderHtml,
+        string OddHeaderHtml,
+        string EvenHeaderHtml,
+        string FirstFooterTemplate,
+        string OddFooterTemplate,
+        string EvenFooterTemplate)
+    {
+        public string HeaderForPage(int pageNumber) =>
+            PickPageTemplate(FirstHeaderHtml, OddHeaderHtml, EvenHeaderHtml, pageNumber);
+
+        public string FooterForPage(int pageNumber) =>
+            PickPageTemplate(FirstFooterTemplate, OddFooterTemplate, EvenFooterTemplate, pageNumber);
+    }
 
     /// <summary>
     /// Generate a self-contained HTML file that previews the Word document
@@ -109,14 +133,7 @@ public partial class WordHandler
         RenderBodyHtml(bodySb, body);
         _ctx.RenderingBody = false;
 
-        // Render header/footer into reusable strings
-        var headerSb = new StringBuilder();
-        RenderHeaderFooterHtml(headerSb, isHeader: true);
-        var headerHtml = headerSb.ToString();
-
-        var footerSb = new StringBuilder();
-        RenderHeaderFooterHtml(footerSb, isHeader: false);
-        var footerHtml = footerSb.ToString();
+        var pageTemplates = BuildPreviewPageTemplates();
 
         // Render footnotes/endnotes
         var footnotesSb = new StringBuilder();
@@ -127,7 +144,7 @@ public partial class WordHandler
         RenderEndnotesHtml(endnotesSb);
         var endnotesHtml = endnotesSb.ToString();
 
-        var bodyContent = bodySb.ToString();
+        var bodyContent = NormalizeStandalonePageBreakParagraphs(bodySb.ToString());
 
         // Split body content on page breaks into pages
         var pages = bodyContent.Split("<!--PAGE_BREAK-->");
@@ -179,18 +196,12 @@ public partial class WordHandler
             }
         }
 
-        // Detect PAGE field in footer and replace with placeholder
-        // Footer typically contains: <span ...>1</span> where "1" is the cached PAGE field value
-        // We replace single-digit page numbers in the footer with a placeholder for per-page substitution
-        var footerHasPageNum = footerHtml.Contains("PAGE") || !string.IsNullOrEmpty(footerHtml);
-        var pageNumPattern = new Regex(@"(<span[^>]*>)\s*\d+\s*(</span>)");
-        var footerTemplate = pageNumPattern.Replace(footerHtml, "$1<!--PAGE_NUM-->$2", 1);
-
         for (int i = 0; i < pageList.Count; i++)
         {
+            var pageNumber = i + 1;
             sb.AppendLine($"<div class=\"page-wrapper\" data-section=\"{i + 1}\">");
-            sb.AppendLine($"<div class=\"page\" data-page=\"{i + 1}\" style=\"{maxW}\">");
-            if (i == 0) sb.Append(headerHtml);
+            sb.AppendLine($"<div class=\"page\" data-page=\"{pageNumber}\" style=\"{maxW}\">");
+            sb.Append(pageTemplates.HeaderForPage(pageNumber));
             sb.Append("<div class=\"page-body\">");
             sb.Append(pageList[i]);
             // Place footnotes on the page that contains the footnote reference
@@ -200,7 +211,9 @@ public partial class WordHandler
             if (i == pageList.Count - 1 && !string.IsNullOrEmpty(endnotesHtml))
                 sb.Append(endnotesHtml);
             sb.Append("</div>");
-            sb.Append(footerTemplate.Replace("<!--PAGE_NUM-->", (i + 1).ToString()));
+            var footerTemplate = pageTemplates.FooterForPage(pageNumber);
+            if (!string.IsNullOrEmpty(footerTemplate))
+                sb.Append(PopulateFooterPageFields(footerTemplate, pageNumber, pageList.Count));
             sb.AppendLine("</div>");
             sb.AppendLine("</div>");
         }
@@ -243,8 +256,24 @@ public partial class WordHandler
         sb.AppendLine("  })();");
         // Auto-pagination: measure content and split overflowing pages
         sb.AppendLine($"  var maxBodyH={bodyHeightPt:0.#}*96/72;"); // pt to px (96dpi)
-        sb.AppendLine("  var ftpl=" + JsStringLiteral(footerTemplate) + ";");
+        sb.AppendLine("  var htplFirst=" + JsStringLiteral(pageTemplates.FirstHeaderHtml) + ";");
+        sb.AppendLine("  var htplOdd=" + JsStringLiteral(pageTemplates.OddHeaderHtml) + ";");
+        sb.AppendLine("  var htplEven=" + JsStringLiteral(pageTemplates.EvenHeaderHtml) + ";");
+        sb.AppendLine("  var ftplFirst=" + JsStringLiteral(pageTemplates.FirstFooterTemplate) + ";");
+        sb.AppendLine("  var ftplOdd=" + JsStringLiteral(pageTemplates.OddFooterTemplate) + ";");
+        sb.AppendLine("  var ftplEven=" + JsStringLiteral(pageTemplates.EvenFooterTemplate) + ";");
         sb.AppendLine(@"
+  function shouldScalePages(){
+    try{return window.top===window.self;}
+    catch(e){return false;}
+  }
+
+  function pickPageTemplate(first, odd, even, pageNum){
+    if(pageNum===1 && first)return first;
+    if(pageNum%2===0 && even)return even;
+    return odd || even || first || '';
+  }
+
   function paginate(){
     var pages=document.querySelectorAll('.page');
     for(var pi=0;pi<pages.length;pi++){
@@ -291,6 +320,13 @@ public partial class WordHandler
       var np=document.createElement('div');
       np.className='page';
       np.style.cssText=page.style.cssText;
+      var nextPageNum=pi+2;
+      var pageHeaderTemplate=pickPageTemplate(htplFirst, htplOdd, htplEven, nextPageNum);
+      if(pageHeaderTemplate){
+        var nh=document.createElement('div');
+        nh.innerHTML=pageHeaderTemplate;
+        if(nh.firstChild)np.appendChild(nh.firstChild);
+      }
       var nb=document.createElement('div');
       nb.className='page-body';
       for(var mi=0;mi<toMove.length;mi++){
@@ -298,9 +334,14 @@ public partial class WordHandler
       }
       np.appendChild(nb);
       // Clone footer into new page
-      var nf=document.createElement('div');
-      nf.innerHTML=ftpl.replace('<!--PAGE_NUM-->',(pi+2).toString());
-      if(nf.firstChild)np.appendChild(nf.firstChild);
+      var pageFooterTemplate=pickPageTemplate(ftplFirst, ftplOdd, ftplEven, nextPageNum);
+      if(pageFooterTemplate){
+        var nf=document.createElement('div');
+        nf.innerHTML=pageFooterTemplate
+          .replace('<!--PAGE_NUM-->', nextPageNum.toString())
+          .replace('<!--PAGE_COUNT-->', pages.length.toString());
+        if(nf.firstChild)np.appendChild(nf.firstChild);
+      }
       nw.appendChild(np);
       var parentWrapper=page.closest('.page-wrapper');
       if(parentWrapper)parentWrapper.after(nw);
@@ -308,17 +349,19 @@ public partial class WordHandler
     }
     // Renumber pages
     var allPages=document.querySelectorAll('.page');
+    var totalPageCount=allPages.length;
     allPages.forEach(function(p,i){
       var nums=p.querySelectorAll('.page-num');
       nums.forEach(function(n){n.textContent=(i+1);});
+      var counts=p.querySelectorAll('.page-count');
+      counts.forEach(function(n){n.textContent=totalPageCount;});
       var footer=p.querySelector('.doc-footer');
-      if(footer){
-        var spans=footer.querySelectorAll('span');
-        spans.forEach(function(s){
-          if(s.textContent.trim().match(/^\d+$/)){
-            s.textContent=(i+1);
-          }
+      if(footer && nums.length===0 && counts.length===0){
+        var spans=Array.from(footer.querySelectorAll('span')).filter(function(s){
+          return s.textContent.trim().match(/^\d+$/);
         });
+        if(spans.length>0)spans[0].textContent=(i+1);
+        if(spans.length>1)spans[spans.length-1].textContent=totalPageCount;
       }
     });
     // Recurse in case new pages also overflow. A page is only eligible for
@@ -341,7 +384,11 @@ public partial class WordHandler
       if(ch>maxBodyH-fh+2 && visibleCount>1)again=true;
     });
     if(again)setTimeout(paginate,0);
-    else{setTimeout(positionFootnotes,0);setTimeout(applyPageFilter,0);setTimeout(function(){scalePages(false);},0);}
+    else{
+      setTimeout(positionFootnotes,0);
+      setTimeout(applyPageFilter,0);
+      if(shouldScalePages())setTimeout(function(){scalePages(false);},0);
+    }
   }
   function positionFootnotes(){
     document.querySelectorAll('.page').forEach(function(page){
@@ -433,6 +480,7 @@ public partial class WordHandler
   }
   var _resizeTimer;
   window.addEventListener('resize',function(){
+    if(!shouldScalePages())return;
     clearTimeout(_resizeTimer);
     _resizeTimer=setTimeout(function(){scalePages(true);},100);
   });");
@@ -449,7 +497,215 @@ public partial class WordHandler
 
         sb.AppendLine("</body>");
         sb.AppendLine("</html>");
+    return sb.ToString();
+    }
+
+    private PreviewPageTemplates BuildPreviewPageTemplates()
+    {
+        var sectPr = GetPreviewSectionProperties();
+        return new PreviewPageTemplates(
+            RenderHeaderFooterHtml(isHeader: true, sectPr, HeaderFooterValues.First),
+            RenderHeaderFooterHtml(isHeader: true, sectPr, HeaderFooterValues.Default),
+            RenderHeaderFooterHtml(isHeader: true, sectPr, HeaderFooterValues.Even),
+            BuildFooterTemplate(RenderHeaderFooterHtml(isHeader: false, sectPr, HeaderFooterValues.First)),
+            BuildFooterTemplate(RenderHeaderFooterHtml(isHeader: false, sectPr, HeaderFooterValues.Default)),
+            BuildFooterTemplate(RenderHeaderFooterHtml(isHeader: false, sectPr, HeaderFooterValues.Even))
+        );
+    }
+
+    private static string PickPageTemplate(string first, string odd, string even, int pageNumber)
+    {
+        if (pageNumber == 1 && !string.IsNullOrEmpty(first))
+            return first;
+        if (pageNumber % 2 == 0 && !string.IsNullOrEmpty(even))
+            return even;
+        if (!string.IsNullOrEmpty(odd))
+            return odd;
+        if (!string.IsNullOrEmpty(even))
+            return even;
+        return first;
+    }
+
+    private static string BuildFooterTemplate(string footerHtml)
+    {
+        if (string.IsNullOrEmpty(footerHtml)) return string.Empty;
+        if (footerHtml.Contains("<!--PAGE_NUM-->") || footerHtml.Contains("<!--PAGE_COUNT-->"))
+            return footerHtml;
+
+        var matchIndex = 0;
+        return Regex.Replace(
+            footerHtml,
+            @"(<span[^>]*>)\s*\d+\s*(</span>)",
+            match =>
+            {
+                matchIndex++;
+                return matchIndex switch
+                {
+                    1 => $"{match.Groups[1].Value}<!--PAGE_NUM-->{match.Groups[2].Value}",
+                    2 => $"{match.Groups[1].Value}<!--PAGE_COUNT-->{match.Groups[2].Value}",
+                    _ => match.Value
+                };
+            });
+    }
+
+    private static string PopulateFooterPageFields(string footerHtml, int pageNumber, int pageCount)
+    {
+        if (string.IsNullOrEmpty(footerHtml)) return string.Empty;
+        return footerHtml
+            .Replace("<!--PAGE_NUM-->", pageNumber.ToString())
+            .Replace("<!--PAGE_COUNT-->", pageCount.ToString());
+    }
+
+    private static string NormalizeStandalonePageBreakParagraphs(string bodyContent)
+    {
+        return Regex.Replace(
+            bodyContent,
+            @"(?:<a id=""w-p-\d+""></a>)?(?:<span class=""w[be]""[^>]*></span>)*<p\b[^>]*>\s*<!--PAGE_BREAK-->\s*</p>",
+            "<!--PAGE_BREAK-->");
+    }
+
+    private SectionProperties? GetPreviewSectionProperties()
+    {
+        var body = _doc.MainDocumentPart?.Document?.Body;
+        return body?.GetFirstChild<SectionProperties>()
+            ?? body?.Descendants<SectionProperties>().LastOrDefault();
+    }
+
+    private string RenderHeaderFooterHtml(
+        bool isHeader,
+        SectionProperties? sectPr,
+        HeaderFooterValues requestedType)
+    {
+        var sb = new StringBuilder();
+        var cssClass = isHeader ? "doc-header" : "doc-footer";
+        var paragraphs = isHeader
+            ? ResolveHeaderPart(sectPr, requestedType)?.Header?.Elements<Paragraph>().ToList()
+            : ResolveFooterPart(sectPr, requestedType)?.Footer?.Elements<Paragraph>().ToList();
+        if (!HasRenderableHeaderFooterContent(paragraphs))
+            return string.Empty;
+
+        var previousRenderingHeaderFooter = _ctx.RenderingHeaderFooter;
+        _ctx.RenderingHeaderFooter = true;
+        _ctx.ResetHeaderFooterFieldState();
+        try
+        {
+            sb.AppendLine($"<div class=\"{cssClass}\">");
+            foreach (var para in paragraphs!)
+            {
+                _ctx.ResetHeaderFooterFieldState();
+                RenderParagraphHtml(sb, para);
+            }
+            sb.AppendLine("</div>");
+        }
+        finally
+        {
+            _ctx.ResetHeaderFooterFieldState();
+            _ctx.RenderingHeaderFooter = previousRenderingHeaderFooter;
+        }
         return sb.ToString();
+    }
+
+    private static string? ParseHeaderFooterFieldType(string? instruction)
+    {
+        if (string.IsNullOrWhiteSpace(instruction)) return null;
+        var fieldName = instruction
+            .Trim()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault()
+            ?.ToUpperInvariant();
+        return fieldName is "PAGE" or "NUMPAGES" or "SECTIONPAGES" ? fieldName : null;
+    }
+
+    private static string GetHeaderFooterFieldPlaceholder(string fieldType)
+    {
+        return fieldType switch
+        {
+            "PAGE" => "<span class=\"page-num\"><!--PAGE_NUM--></span>",
+            "NUMPAGES" or "SECTIONPAGES" => "<span class=\"page-count\"><!--PAGE_COUNT--></span>",
+            _ => string.Empty
+        };
+    }
+
+    private HeaderPart? ResolveHeaderPart(SectionProperties? sectPr, HeaderFooterValues requestedType)
+    {
+        var mainPart = _doc.MainDocumentPart;
+        if (mainPart == null) return null;
+        if (sectPr != null)
+        {
+            var relId = ResolveHeaderFooterRelId(sectPr.Elements<HeaderReference>(), requestedType);
+            if (!string.IsNullOrEmpty(relId))
+            {
+                try { return mainPart.GetPartById(relId) as HeaderPart; }
+                catch { }
+            }
+        }
+        return mainPart.HeaderParts.FirstOrDefault();
+    }
+
+    private FooterPart? ResolveFooterPart(SectionProperties? sectPr, HeaderFooterValues requestedType)
+    {
+        var mainPart = _doc.MainDocumentPart;
+        if (mainPart == null) return null;
+        if (sectPr != null)
+        {
+            var relId = ResolveHeaderFooterRelId(sectPr.Elements<FooterReference>(), requestedType);
+            if (!string.IsNullOrEmpty(relId))
+            {
+                try { return mainPart.GetPartById(relId) as FooterPart; }
+                catch { }
+            }
+        }
+        return mainPart.FooterParts.FirstOrDefault();
+    }
+
+    private static string? ResolveHeaderFooterRelId<TReference>(
+        IEnumerable<TReference> references,
+        HeaderFooterValues requestedType)
+        where TReference : HeaderFooterReferenceType
+    {
+        var refs = references.ToList();
+        var relId = refs.FirstOrDefault(r => r.Type?.Value == requestedType)?.Id?.Value;
+        if (!string.IsNullOrEmpty(relId)) return relId;
+
+        relId = refs.FirstOrDefault(r => r.Type?.Value == HeaderFooterValues.Default)?.Id?.Value;
+        if (!string.IsNullOrEmpty(relId)) return relId;
+
+        if (requestedType != HeaderFooterValues.First)
+        {
+            relId = refs.FirstOrDefault(r => r.Type?.Value == HeaderFooterValues.First)?.Id?.Value;
+            if (!string.IsNullOrEmpty(relId)) return relId;
+        }
+
+        if (requestedType != HeaderFooterValues.Even)
+        {
+            relId = refs.FirstOrDefault(r => r.Type?.Value == HeaderFooterValues.Even)?.Id?.Value;
+            if (!string.IsNullOrEmpty(relId)) return relId;
+        }
+
+        return refs.FirstOrDefault()?.Id?.Value;
+    }
+
+    private static bool HasRenderableHeaderFooterContent(IEnumerable<Paragraph>? paragraphs)
+    {
+        return paragraphs != null && paragraphs.Any(HasRenderableHeaderFooterContent);
+    }
+
+    private static bool HasRenderableHeaderFooterContent(Paragraph para)
+    {
+        if (!string.IsNullOrWhiteSpace(GetParagraphText(para)))
+            return true;
+
+        return para.Descendants<DeletedText>().Any(t => !string.IsNullOrEmpty(t.Text))
+            || para.Descendants<Drawing>().Any()
+            || para.Descendants<EmbeddedObject>().Any()
+            || para.Descendants<Hyperlink>().Any()
+            || para.Descendants<SymbolChar>().Any()
+            || para.Descendants<SimpleField>().Any()
+            || para.Descendants<FieldCode>().Any(fc => !string.IsNullOrWhiteSpace(fc.Text))
+            || para.ChildElements.Any(child =>
+                child.LocalName is "oMath" or "oMathPara"
+                || child is M.OfficeMath
+                || child is M.Paragraph);
     }
 
     // ==================== Page Layout + Doc Defaults from OOXML ====================
@@ -464,7 +720,7 @@ public partial class WordHandler
     private PageLayout GetPageLayout()
     {
         if (_ctx?.CachedPageLayout != null) return _ctx.CachedPageLayout;
-        var sectPr = _doc.MainDocumentPart?.Document?.Body?.GetFirstChild<SectionProperties>();
+        var sectPr = GetPreviewSectionProperties();
         var pgSz = sectPr?.GetFirstChild<PageSize>();
         var pgMar = sectPr?.GetFirstChild<PageMargin>();
         const double c = 2.54 / 1440.0; // twips → cm
@@ -534,12 +790,16 @@ public partial class WordHandler
 
         // docGrid linePitch — controls CJK snap-to-grid line spacing (twips → pt)
         double gridLinePitchPt = 0;
-        var sectPr = _doc.MainDocumentPart?.Document?.Body?.GetFirstChild<SectionProperties>();
+        var sectPr = GetPreviewSectionProperties();
         var docGrid = sectPr?.GetFirstChild<DocGrid>();
-        if (docGrid?.Type?.Value == DocGridValues.Lines || docGrid?.Type?.Value == DocGridValues.LinesAndChars)
+        // MOD(#11): see cove-desktop-mods.md
+        // WPS-authored DOCX frequently omits w:docGrid/@w:type while still
+        // writing a meaningful linePitch. Treat "type missing + linePitch>0"
+        // as an active line grid instead of dropping back to browser defaults.
+        if (docGrid?.LinePitch?.Value is int lp && lp > 0
+            && docGrid.Type?.Value != DocGridValues.SnapToChars)
         {
-            if (docGrid.LinePitch?.Value is int lp && lp > 0)
-                gridLinePitchPt = lp / 20.0; // twips to pt
+            gridLinePitchPt = lp / 20.0; // twips to pt
         }
 
         // Default text color: docDefaults → theme dk1
@@ -754,38 +1014,7 @@ public partial class WordHandler
 
     private void RenderHeaderFooterHtml(StringBuilder sb, bool isHeader)
     {
-        var cssClass = isHeader ? "doc-header" : "doc-footer";
-
-        if (isHeader)
-        {
-            var headerParts = _doc.MainDocumentPart?.HeaderParts;
-            if (headerParts == null) return;
-            foreach (var hp in headerParts)
-            {
-                var paragraphs = hp.Header?.Elements<Paragraph>().ToList();
-                if (paragraphs == null || paragraphs.Count == 0) continue;
-                if (paragraphs.All(p => string.IsNullOrWhiteSpace(GetParagraphText(p)))) continue;
-                sb.AppendLine($"<div class=\"{cssClass}\">");
-                foreach (var para in paragraphs) RenderParagraphHtml(sb, para);
-                sb.AppendLine("</div>");
-                break;
-            }
-        }
-        else
-        {
-            var footerParts = _doc.MainDocumentPart?.FooterParts;
-            if (footerParts == null) return;
-            foreach (var fp in footerParts)
-            {
-                var paragraphs = fp.Footer?.Elements<Paragraph>().ToList();
-                if (paragraphs == null || paragraphs.Count == 0) continue;
-                if (paragraphs.All(p => string.IsNullOrWhiteSpace(GetParagraphText(p)))) continue;
-                sb.AppendLine($"<div class=\"{cssClass}\">");
-                foreach (var para in paragraphs) RenderParagraphHtml(sb, para);
-                sb.AppendLine("</div>");
-                break;
-            }
-        }
+        sb.Append(RenderHeaderFooterHtml(isHeader, GetPreviewSectionProperties(), HeaderFooterValues.Default));
     }
 
     // ==================== Body Rendering ====================
@@ -835,6 +1064,14 @@ public partial class WordHandler
                 var id = bodyCre.Id?.Value;
                 if (id != null)
                     _ctx.OpenCommentMarks.Remove(id);
+                continue;
+            }
+
+            if (element is Paragraph manualPageBreakPara
+                && string.IsNullOrWhiteSpace(GetParagraphText(manualPageBreakPara))
+                && manualPageBreakPara.OuterXml.Contains("w:br w:type=\"page\"", StringComparison.Ordinal))
+            {
+                sb.Append("<!--PAGE_BREAK-->");
                 continue;
             }
 

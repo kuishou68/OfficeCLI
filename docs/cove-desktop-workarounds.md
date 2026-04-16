@@ -133,6 +133,173 @@
 
 ---
 
+### 12. 主预览 HTML 复用 DOCX 磁盘缓存，避免重复冷启动 OfficeCLI
+
+- **What**：`officecli_view_html` 在真正执行 `view <file> html --json` 之前，先按 `DOCX 字节内容 FNV-1a hash + renderer cache version` 查找 `<app_data_dir>/pdf-cache/*.officecli.vN.html`；命中时直接返回缓存 HTML，未命中才调用 OfficeCLI 并把结果写回磁盘缓存。当前 renderer cache version 已提升到 `v7`，用于覆盖页眉页脚定位、`docGrid linePitch` 行高修正，以及 macOS CJK 字体 metrics 别名补齐后的新 HTML
+- **Why**：
+  - 主文件预览路径此前每次打开 `.docx` 都会直连 `officecli_view_html`，完全绕过 `docx_to_html` 已有的 L2 HTML 缓存
+  - OfficeCLI resident warm 之后很快，但首轮 `view html` 仍有明显冷启动成本；在 React StrictMode 或快速重开预览时，这个成本会被用户反复感知
+  - 仅按 DOCX 内容 hash 命中缓存时，sidecar renderer 升级后会继续复用旧 HTML，导致“二进制已更新但预览还停留在旧版 DOM/CSS”
+- **Solves**：
+  - 主预览与浮窗预览在“同一份 DOCX 已经生成过 HTML”时共享磁盘缓存收益
+  - 避免同一文档反复打开时重复触发 OfficeCLI 冷启动，缩短加载首屏时间
+  - 当 OfficeCLI HTML 渲染逻辑升级（例如页眉页脚、页码、对齐、分页修复）时，旧缓存会自动失效，用户不需要手工删 cache 目录
+- **Location**：`mod.rs` `officecli_view_html`
+- **Added**：2026-04-15，commit `401c49f` 后续修复提交
+- **Upstream note**：这是 cove-desktop 侧的预览缓存策略，不依赖上游改动；若未来 OfficeCLI 提供稳定的持久化 HTML cache API，可删掉本地文件缓存复用
+
+---
+
+### 13. 锁文件错误直传，禁止 batch 失败后退回逐条 patch
+
+- **What**：
+  - `cli.rs` 在 `run_cli` 中解析 OfficeCLI `--json` 的结构化失败体：即使非零退出码把错误写在 stdout，也会抽取真实错误信息
+  - `adapter.rs` 的 `execute_ops_batch` 遇到“文件被其他进程占用”这类 batch 级失败时，不再回退到 legacy per-op `set/add/remove`，而是把同一个锁错误直接回写到各 op
+- **Why**：
+  - OfficeCLI v1.0.46 在 `.docx` 被外部进程持有排它锁时，`batch ... --json` 会 `exit 1`，但真正的原因只写在 stdout JSON：`"The process cannot access the file ... because it is being used by another process."`
+  - 旧适配层对非零退出码只拼 `stderr`，导致 batch 根因被吞掉；随后又无条件 fallback 到逐条 `set`，每条 patch 都再次因同一把锁失败，最终只给用户留下多条 `[patch] ... officecli exited with code 1`
+- **Solves**：
+  - 校对/修订场景下，文档被 Word / WPS / 预览进程占用时，用户能直接看到“文件被占用”的根因，而不是误以为某几个段落 patch 本身坏了
+  - 避免 batch 失败后再次触发一轮无意义的逐条写入，减少锁冲突放大和误导性日志
+- **Location**：
+  - `cli.rs` `run_cli`
+  - `adapter.rs` `execute_ops_batch`
+- **Added**：2026-04-15（本次）
+- **Upstream note**：如果上游未来统一为“非零退出时把结构化错误写到 stderr，且为锁错误提供稳定错误码”，可删除本地 stdout 错误抽取和锁错误禁 fallback 逻辑
+
+---
+
+### 14. Translation 默认 bookmark 不再补第二轮 batch
+
+- **What**：`officecli` adapter 里的 `insertAfter/insertBefore` 仍默认给段落打 `style=Translation`，但不再把默认 `trans_<id>` bookmark 物化成真实 bookmark 节点；读取阶段直接依赖 `style=Translation -> trans_<原文 id>` 的本地合成。只有调用方显式传入的非默认 bookmark，才继续走第二轮紧凑 bookmark batch
+- **Why**：
+  - 默认双语对照翻译并不需要真实 bookmark 节点，`confirm_edits` 的 collapse 只识别 `trans_*` 语义标记
+  - 旧链路里主 batch 成功后还会再补一轮 `add bookmark`，大量翻译段落时相当于额外写一遍文档
+- **Solves**：
+  - `WordAgent` 双语对照翻译时，`doc_edit` 默认只做一次主 batch，不再为每个默认 Translation 插入追加第二轮写回
+  - 保持现有 contrast-mode 语义不变，同时缩短整页/整章翻译耗时
+- **Location**：
+  - `src/lib/doc/adapters/officecli.ts`
+  - `src-tauri/src/officecli/adapter.rs`
+- **Added**：2026-04-15（本次）
+- **Upstream note**：这是 cove-desktop 对 OfficeCLI 调用链的瘦身；如果上游未来让 batch 直接返回稳定的新建段落 path，并且我们重新需要真实 bookmark 节点，可恢复物化写入
+
+---
+
+### 15. 读命令不再直连 resident 主 pipe，取消 DOCX 高亮预热
+
+- **What**：
+  - `cove-desktop` 的 `cli.rs` 不再让 `query/view/get/raw` 走本地实现的 resident 主 pipe 直连，只保留写命令直连
+  - 文件树第一次高亮 `.docx` 时，不再后台预热 `officecli_prepare_html_preview`
+- **Why**：
+  - cove 本地 Rust 直连 resident 主 pipe 的实现，没有复刻上游 `TryResident(...)` 的 ping pipe 探活 + busy main pipe 重试/降级
+  - 一旦后台 `view html` 仍占着 resident 主 pipe，后续 `doc_read(query p)` / 再次 `view html` 会在 cove 侧排队到本地 60s timeout，而直接 shell 出 bundled `officecli` 实测只要约 `0.8s`
+- **Solves**：
+  - 翻译前 `doc_read` 不再被预览 resident 的长命令卡满
+  - 仅高亮文件时不再偷跑预览导出，减少和文档编辑/翻译链路的资源争抢
+  - 读命令继续享受上游 CLI 的 resident 复用，但 busy 情况交回上游处理，不再被 cove 本地直连放大
+- **Location**：
+  - `src-tauri/src/officecli/cli.rs`
+  - `src/components/preview/FileTreePanel.tsx`
+- **Added**：2026-04-15（本次）
+- **Upstream note**：这是 cove-desktop 对 resident 编排的调用链修正，不依赖 OfficeCLI 上游改动；如果未来 cove 补齐与 `TryResident(...)` 等价的 ping+buzzy-handling，可再评估恢复读命令直连
+
+---
+
+### 16. 读路径先经 ping pipe 关闭同文件 resident
+
+- **What**：
+  - `cove-desktop` 的 `cli.rs` 新增 `close_resident_best_effort(file)`，直接向 `<pipe>-ping` 发送 `__close__`
+  - `query_all_paragraphs`、`officecli_view_paragraphs`、以及主预览 cache miss 的 `view html` 在真正读文件前，都会先做一次 best-effort close；如果没有 resident，就静默跳过
+- **Why**：
+  - 即使 cove 侧已经不再“直连 resident 主 pipe”，上游 `officecli query/view` 仍会优先复用一个已经存在的 resident
+  - 一旦这个 resident 本身就是陈旧/卡死/刚被别的 `view html` 打满主 pipe，新的 `doc_read` 还是会沿着上游 `TryResident(...)` 链路卡到 30s~60s
+  - 对同一份 `/Users/pojian/Downloads/随便测试一下.docx` 的实测里，直接 shell 出 bundled `officecli query p --json` / `view html --json` 都在 `~0.8s`；而 UI 链路重复出现 `doc_read≈60.7s`，剩余差值只能落在“沿用了坏 resident”这层编排
+- **Solves**：
+  - 翻译前 `doc_read(query p)` 不再继承一个已经不健康的 resident
+  - 主预览 cache miss 的 `view html` 也先清 resident，避免继续复用同一个坏实例
+  - AI 工具走 `officecli_view_paragraphs` 时同样获得保护，减少文本读取偶发长卡顿
+- **Location**：
+  - `src-tauri/src/officecli/cli.rs`
+  - `src-tauri/src/officecli/adapter.rs`
+  - `src-tauri/src/officecli/mod.rs`
+- **Added**：2026-04-15（本次）
+- **Upstream note**：理想修复是 OfficeCLI 给 `query/view` 提供稳定的“禁止复用现有 resident”选项，或把 stale/busy resident 判定前移到 ping 阶段；在那之前，保留 cove 侧的 best-effort close
+
+---
+
+### 17. 读命令 shell-out 显式跳过 resident
+
+- **What**：`cove-desktop` 的 `cli.rs` 在 shell 出去执行 `query/view/get/raw` 时额外注入 `OFFICECLI_SKIP_RESIDENT=1`。配合已修改的 OfficeCLI `TryResident(...)`，这些读命令会直接回落到 direct file access，不再探测/复用/自启动 resident
+- **Why**：
+  - 单靠 §16 的 best-effort `__close__` 只能清掉“空闲但坏掉”的 resident；如果 resident 正在跑慢 `view html`，`__close__` 会等它收尾，短超时后仍可能让后续读命令继续撞回同一个 busy resident
+  - 用户这轮 43.2s 翻译里，真实写入 `doc_edit` 已经只有 `~0.9s`，剩下的大头就是读命令反复继承 resident 的等待成本
+- **Solves**：
+  - `doc_read(query p)`、预览 `view html`、以及工具态 `view text/get/raw` 都不会再因 resident main pipe 状态而出现 30s~60s 级卡顿
+  - 读命令统一走 direct path；写命令仍保留 resident / batch 的性能收益，不把之前已优化好的写链路拖慢
+- **Location**：
+  - `src-tauri/src/officecli/cli.rs`
+  - 依赖上游补丁：`OfficeCLI/src/officecli/CommandBuilder.cs`
+- **Added**：2026-04-15（本次）
+- **Upstream note**：如果 OfficeCLI 将来正式提供 `--no-resident` 或等效 flag，可删掉这个环境变量约定并改走官方参数
+
+---
+
+### 19. Translation 插入前检查相邻同文译文，阻止重复翻译
+
+- **What**：`officecli_apply_text_ops` 在把 `insertAfter` / `insertBefore` 翻译为 batch 命令前，会检查目标原文段落相邻的 `style=Translation` 段落；若已存在文本完全相同的译文，则直接拒绝该 op，不再继续插入
+- **Why**：
+  - 对照翻译默认只靠 `style=Translation` 和 `trans_<id>` 语义恢复配对，并没有真实唯一键约束
+  - 当用户在已插入过译文的文档上再次发起翻译，或代理因重试重复发送同一批 Translation insert op 时，旧链路会把同一段英文再次插到原文旁边
+- **Solves**：
+  - 修复 `doc_edit` 成功后文档里出现“双份同文译文段落”的问题
+  - 让重复翻译退化为明确错误，而不是继续污染 DOCX 结构
+- **Location**：
+  - `src-tauri/src/officecli/adapter.rs`
+  - `existing_translation_neighbor_has_same_text`
+  - `prepare_batch_op`
+- **Added**：2026-04-16（本次）
+- **Upstream note**：这是 cove-desktop 在调用链上的幂等保护；若上游未来为 paragraph insert 提供稳定的“按 anchor + semantic key 去重”能力，可删除本地邻段扫描
+
+---
+
+### 20. Resident JSON 响应去 BOM，避免 batch 被重复执行
+
+- **What**：`cli.rs` 在解析 resident 主 pipe / ping pipe 返回的 JSON 前，会先去掉 UTF-8 BOM 和前导空白，再交给 `serde_json`
+- **Why**：
+  - 当前本地 OfficeCLI resident 返回体前面可能带 BOM，例如 `\u{feff}{"ExitCode":0,...}`
+  - 旧实现直接 `serde_json::from_str(&line)`，解析失败后被当成 resident miss，再回退到 shell-out
+  - 对 `batch add paragraph` 这类写命令来说，resident 其实已经成功执行过一次；随后 shell-out 再跑一遍，就会把同一译文重复插入
+- **Solves**：
+  - 修复“单次 `doc_edit` 成功，但译文在文档里出现两份”的真正重复执行问题
+  - 避免 ping pipe 的健康检查被 BOM 误判成坏 resident
+- **Location**：
+  - `src-tauri/src/officecli/cli.rs`
+  - `run_resident`
+  - `run_ping_request`
+- **Added**：2026-04-16（本次）
+- **Upstream note**：若上游确认 resident 永远输出无 BOM 的纯 JSON，此条仍可保留为兼容层；成本极低，不必急于移除
+
+---
+
+### 21. Contrast 确认走单次 Rust 快路径，避免长文档分页折叠
+
+- **What**：`confirm_edits(mode="contrast")` 对 officecli backend 不再走“TS 分页 `readParagraphs` 全文 + 再调一次通用 `applyTextOps`”的默认折叠流程，而是直接调用新的 `officecli_collapse_contrast_pairs` Tauri 命令，在 Rust 侧一次性构建 rewrite/delete batch 并提交给 OfficeCLI
+- **Why**：
+  - 长文档翻译确认阶段原本要多次跨端 IPC 读取整篇段落，再把同一批折叠 op 重新发回 Rust，确认耗时会随着段落数线性放大
+  - `doc_edit` 插入对照译文之后，session 里本来就有同一份段落快照；折叠再退回 TS 层重新分页读取，纯属重复搬运
+- **Solves**：
+  - 减少 contrast 确认阶段的 IPC 往返次数和分页读取开销
+  - 为长文档翻译确认提供更稳定的耗时上界，避免“确认修改”阶段比真正写入还慢
+- **Location**：
+  - `src-tauri/src/officecli/adapter.rs`
+  - `src-tauri/src/lib.rs`
+  - `src/lib/doc/adapters/officecli.ts`
+- **Added**：2026-04-16（本次）
+- **Upstream note**：这是 cove-desktop 本地的折叠编排优化；若上游未来提供原生“merge contrast translations”命令，可以删掉本地快路径并改用官方能力
+
+---
+
 ## 流程规范
 
 ### 新增魔改时必须做的事

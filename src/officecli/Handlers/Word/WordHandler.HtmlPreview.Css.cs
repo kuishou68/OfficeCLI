@@ -181,17 +181,11 @@ public partial class WordHandler
         var styleId = pProps.ParagraphStyleId?.Val?.Value;
 
         // Alignment (direct or from style chain)
-        var jc = pProps.Justification?.Val;
-        if (jc == null) jc = ResolveJustificationFromStyle(styleId);
-        if (jc != null)
+        var jc = pProps.Justification?.Val?.InnerText;
+        if (string.IsNullOrWhiteSpace(jc)) jc = ResolveJustificationFromStyle(styleId);
+        if (!string.IsNullOrWhiteSpace(jc))
         {
-            var align = jc.InnerText switch
-            {
-                "center" => "center",
-                "right" or "end" => "right",
-                "both" or "distribute" => "justify",
-                _ => (string?)null
-            };
+            var align = MapJustificationToCss(jc);
             if (align != null) parts.Add($"text-align:{align}");
         }
 
@@ -258,38 +252,14 @@ public partial class WordHandler
             else if (afterLinesVal is int afterLines)
                 parts.Add($"{vSpacingPropAfter}:{afterLines / 100.0:0.##}em");
 
-            // Line: try direct, then style fallback
-            var lineVal = pProps.SpacingBetweenLines?.Line?.Value
-                          ?? styleSpacing?.Line?.Value;
-            if (lineVal is string lv)
-            {
-                var rule = pProps.SpacingBetweenLines?.LineRule?.InnerText
-                           ?? styleSpacing?.LineRule?.InnerText;
-                if (rule == "auto" || rule == null)
-                {
-                    if (int.TryParse(lv, out var lvNum))
-                    {
-                        // Correct for font metrics: Word uses (winAscent+winDescent)/UPM as base
-                        var paraFont = ResolveParaFontForLineHeight(para);
-                        var ratio = FontMetricsReader.GetRatio(paraFont);
-                        parts.Add($"line-height:{lvNum / 240.0 * ratio:0.##}");
-                    }
-                }
-                else if (rule == "exact" || rule == "atLeast")
-                {
-                    parts.Add($"line-height:{Units.TwipsToPt(lv):0.##}pt");
-                }
-            }
         }
 
         // MOD(#6): see cove-desktop-mods.md
         // Always emit an inline line-height derived from the paragraph's
-        // effective spacing + actual font metrics. Without this, paragraphs
-        // that lack explicit w:spacing fall back to the global <p> CSS and use
-        // the document default font's metrics instead of the paragraph's real
-        // EastAsia/Ascii font, which makes Word/WPS previews look too tight.
-        if (!parts.Any(p => p.StartsWith("line-height", StringComparison.Ordinal)))
-            parts.Add(BuildDefaultParagraphLineHeightCss(para, styleSpacing, docDefaults));
+        // effective spacing + actual font metrics. This path also folds in the
+        // section docGrid linePitch when the body text snaps to grid, so WPS /
+        // Word previews do not collapse back to the browser's tighter default.
+        parts.Add(BuildDefaultParagraphLineHeightCss(para, styleSpacing, docDefaults));
 
         // Shading / background (direct or from style)
         var shading = pProps.Shading;
@@ -365,22 +335,63 @@ public partial class WordHandler
             ?? styleSpacing?.Line?.Value;
         var rule = para.ParagraphProperties?.SpacingBetweenLines?.LineRule?.InnerText
             ?? styleSpacing?.LineRule?.InnerText;
+        var paraFont = ResolveParaFontForLineHeight(para);
+        var ratio = FontMetricsReader.GetRatio(paraFont);
+        var paraFontSizePt = ResolveParaFontSizePt(para, docDefaults);
 
         if (lineVal is string explicitLine)
         {
             if ((rule == "auto" || rule == null) && int.TryParse(explicitLine, out var autoLine))
             {
-                var paraFont = ResolveParaFontForLineHeight(para);
-                var ratio = FontMetricsReader.GetRatio(paraFont);
-                return $"line-height:{autoLine / 240.0 * ratio:0.##}";
+                var autoLineHeightPt = paraFontSizePt * (autoLine / 240.0) * ratio;
+                autoLineHeightPt = ClampBodyParagraphToDocGrid(autoLineHeightPt, docDefaults);
+                return $"line-height:{autoLineHeightPt:0.##}pt";
             }
             if (rule == "exact" || rule == "atLeast")
                 return $"line-height:{Units.TwipsToPt(explicitLine):0.##}pt";
         }
 
-        var defaultFont = ResolveParaFontForLineHeight(para);
-        var defaultRatio = FontMetricsReader.GetRatio(defaultFont);
-        return $"line-height:{docDefaults.LineHeight * defaultRatio:0.##}";
+        var defaultLineHeightPt = paraFontSizePt * docDefaults.LineHeight * ratio;
+        defaultLineHeightPt = ClampBodyParagraphToDocGrid(defaultLineHeightPt, docDefaults);
+        return $"line-height:{defaultLineHeightPt:0.##}pt";
+    }
+
+    private double ResolveParaFontSizePt(Paragraph para, DocDef docDefaults)
+    {
+        var firstRun = para.Elements<Run>().FirstOrDefault(r =>
+            r.ChildElements.Any(c => c is Text t && !string.IsNullOrEmpty(t.Text)));
+        if (firstRun != null)
+        {
+            var rProps = ResolveEffectiveRunProperties(firstRun, para);
+            if (rProps.FontSize?.Val?.Value is string runSize && double.TryParse(runSize, out var halfPts))
+                return halfPts / 2.0;
+        }
+
+        var styleId = para.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
+        if (!string.IsNullOrWhiteSpace(styleId))
+        {
+            var styleFontSize = ResolveStyleFontSize(styleId);
+            if (!string.IsNullOrWhiteSpace(styleFontSize)
+                && styleFontSize.EndsWith("pt", StringComparison.OrdinalIgnoreCase)
+                && double.TryParse(styleFontSize[..^2], out var stylePt))
+                return stylePt;
+        }
+
+        return docDefaults.SizePt;
+    }
+
+    private double ClampBodyParagraphToDocGrid(double lineHeightPt, DocDef docDefaults)
+    {
+        // MOD(#11): see cove-desktop-mods.md
+        // Section docGrid linePitch is measured from the page edge grid, not
+        // from the browser's anonymous line box. When preview paragraphs emit
+        // their own inline line-height they override the page-level grid
+        // fallback, so we clamp body text here to keep the rendered baseline
+        // spacing aligned with WPS / Word.
+        if (_ctx?.RenderingHeaderFooter == true) return lineHeightPt;
+        return docDefaults.GridLinePitchPt > 0
+            ? Math.Max(lineHeightPt, docDefaults.GridLinePitchPt)
+            : lineHeightPt;
     }
 
     /// <summary>
@@ -411,7 +422,7 @@ public partial class WordHandler
     /// <summary>
     /// Resolve Justification from the style chain.
     /// </summary>
-    private JustificationValues? ResolveJustificationFromStyle(string? styleId)
+    private string? ResolveJustificationFromStyle(string? styleId)
     {
         if (styleId == null) return null;
         var visited = new HashSet<string>();
@@ -421,11 +432,22 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var jc = style.StyleParagraphProperties?.Justification?.Val;
-            if (jc != null) return jc;
+            var jc = style.StyleParagraphProperties?.Justification?.Val?.InnerText;
+            if (!string.IsNullOrWhiteSpace(jc)) return jc;
             currentStyleId = style.BasedOn?.Val?.Value;
         }
         return null;
+    }
+
+    private static string? MapJustificationToCss(string? jc)
+    {
+        return jc?.Trim().ToLowerInvariant() switch
+        {
+            "center" => "center",
+            "right" or "end" => "right",
+            "both" or "distribute" => "justify",
+            _ => null
+        };
     }
 
     /// <summary>
@@ -532,11 +554,27 @@ public partial class WordHandler
     /// </summary>
     private Indentation? ResolveIndentationFromStyle(string? styleId)
     {
+        // MOD(#7): see cove-desktop-mods.md
+        // Merge indentation property-by-property across the style chain and
+        // docDefaults instead of returning the first <w:ind> node we hit.
+        // WPS-authored docs often split left/right/firstLine across basedOn
+        // levels; stopping early loses inherited paragraph margins.
+        var merged = new Indentation();
+
+        void MergeIndentation(Indentation? source)
+        {
+            if (source == null) return;
+            merged.Left ??= source.Left?.Value;
+            merged.Right ??= source.Right?.Value;
+            merged.FirstLine ??= source.FirstLine?.Value;
+            merged.Hanging ??= source.Hanging?.Value;
+        }
+
         if (styleId == null)
         {
             var defaultStyle = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.Type?.Value == StyleValues.Paragraph && s.Default?.Value == true);
-            return defaultStyle?.StyleParagraphProperties?.Indentation;
+            MergeIndentation(defaultStyle?.StyleParagraphProperties?.Indentation);
         }
         var visited = new HashSet<string>();
         var currentStyleId = styleId;
@@ -545,11 +583,19 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var ind = style.StyleParagraphProperties?.Indentation;
-            if (ind != null) return ind;
+            MergeIndentation(style.StyleParagraphProperties?.Indentation);
             currentStyleId = style.BasedOn?.Val?.Value;
         }
-        return null;
+
+        MergeIndentation(_doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+            ?.DocDefaults?.ParagraphPropertiesDefault?.ParagraphPropertiesBaseStyle?.Indentation);
+
+        return merged.Left != null
+            || merged.Right != null
+            || merged.FirstLine != null
+            || merged.Hanging != null
+            ? merged
+            : null;
     }
 
     /// <summary>
@@ -568,70 +614,52 @@ public partial class WordHandler
         }
 
         var parts = new List<string>();
-        var visited = new HashSet<string>();
-        var currentStyleId = styleId;
-        while (currentStyleId != null && visited.Add(currentStyleId))
+        var docDefaults = ReadDocDefaults();
+
+        var jc = ResolveJustificationFromStyle(styleId);
+        if (!string.IsNullOrWhiteSpace(jc))
         {
-            var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
-                ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
-            if (style == null) break;
-
-            var pPr = style.StyleParagraphProperties;
-            if (pPr != null)
-            {
-                var jc = pPr.Justification?.Val;
-                if (jc != null && !parts.Any(p => p.StartsWith("text-align")))
-                {
-                    var align = jc.InnerText switch { "center" => "center", "right" or "end" => "right", "both" => "justify", _ => (string?)null };
-                    if (align != null) parts.Add($"text-align:{align}");
-                }
-
-                var spacing = pPr.SpacingBetweenLines;
-                if (spacing != null)
-                {
-                    if (!parts.Any(p => p.StartsWith("margin-top")))
-                    {
-                        if (spacing.Before?.Value is string b && b != "0")
-                            parts.Add($"margin-top:{Units.TwipsToPt(b):0.##}pt");
-                        else if (spacing.BeforeLines?.Value is int bl && bl != 0)
-                            parts.Add($"margin-top:{bl / 100.0:0.##}em");
-                    }
-                    if (!parts.Any(p => p.StartsWith("margin-bottom")))
-                    {
-                        if (spacing.After?.Value is string a)
-                            parts.Add($"margin-bottom:{Units.TwipsToPt(a):0.##}pt");
-                        else if (spacing.AfterLines?.Value is int al)
-                            parts.Add($"margin-bottom:{al / 100.0:0.##}em");
-                    }
-                    if (spacing.Line?.Value is string lv && !parts.Any(p => p.StartsWith("line-height")))
-                    {
-                        var rule = spacing.LineRule?.InnerText;
-                        if ((rule == "auto" || rule == null) && int.TryParse(lv, out var val))
-                            parts.Add($"line-height:{val / 240.0:0.##}");
-                    }
-                }
-
-                // Indentation
-                var ind = pPr.Indentation;
-                if (ind != null)
-                {
-                    if (ind.Left?.Value is string leftTwips && leftTwips != "0" && !parts.Any(p => p.StartsWith("margin-left")))
-                        parts.Add($"margin-left:{Units.TwipsToPt(leftTwips):0.##}pt");
-                    if (ind.Right?.Value is string rightTwips && rightTwips != "0" && !parts.Any(p => p.StartsWith("margin-right")))
-                        parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
-                    if (ind.FirstLine?.Value is string fl && fl != "0" && !parts.Any(p => p.StartsWith("text-indent")))
-                        parts.Add($"text-indent:{Units.TwipsToPt(fl):0.##}pt");
-                    if (ind.Hanging?.Value is string hg && hg != "0" && !parts.Any(p => p.StartsWith("text-indent")))
-                        parts.Add($"text-indent:-{Units.TwipsToPt(hg):0.##}pt");
-                }
-
-                var shadingFill = ResolveShadingFill(pPr.Shading);
-                if (shadingFill != null && !parts.Any(p => p.StartsWith("background")))
-                    parts.Add($"background-color:{shadingFill}");
-            }
-
-            currentStyleId = style.BasedOn?.Val?.Value;
+            var align = MapJustificationToCss(jc);
+            if (align != null) parts.Add($"text-align:{align}");
         }
+
+        var spacing = ResolveSpacingFromStyle(styleId);
+        if (spacing != null)
+        {
+            if (spacing.Before?.Value is string beforeTwips && beforeTwips != "0")
+                parts.Add($"margin-top:{Units.TwipsToPt(beforeTwips):0.##}pt");
+            else if (spacing.BeforeLines?.Value is int beforeLines && beforeLines != 0)
+                parts.Add($"margin-top:{beforeLines / 100.0:0.##}em");
+
+            if (spacing.After?.Value is string afterTwips && afterTwips != "0")
+                parts.Add($"margin-bottom:{Units.TwipsToPt(afterTwips):0.##}pt");
+            else if (spacing.AfterLines?.Value is int afterLines && afterLines != 0)
+                parts.Add($"margin-bottom:{afterLines / 100.0:0.##}em");
+        }
+
+        // MOD(#7): see cove-desktop-mods.md
+        // Style-only paragraphs should use the same font-metric-aware
+        // line-height path as paragraphs with direct pPr, otherwise WPS and
+        // Word renderings drift on documents that inherit spacing from styles.
+        parts.Add(BuildDefaultParagraphLineHeightCss(para, spacing, docDefaults));
+
+        var ind = ResolveIndentationFromStyle(styleId);
+        if (ind != null)
+        {
+            if (ind.Left?.Value is string leftTwips && leftTwips != "0")
+                parts.Add($"margin-left:{Units.TwipsToPt(leftTwips):0.##}pt");
+            if (ind.Right?.Value is string rightTwips && rightTwips != "0")
+                parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
+            if (ind.FirstLine?.Value is string fl && fl != "0")
+                parts.Add($"text-indent:{Units.TwipsToPt(fl):0.##}pt");
+            if (ind.Hanging?.Value is string hg && hg != "0")
+                parts.Add($"text-indent:-{Units.TwipsToPt(hg):0.##}pt");
+        }
+
+        var shadingFill = ResolveParagraphShadingFromStyle(para);
+        if (shadingFill != null)
+            parts.Add($"background-color:{shadingFill}");
+
         return string.Join(";", parts);
     }
 
@@ -1375,6 +1403,14 @@ public partial class WordHandler
         var mR = $"{pg.MarginRightPt:0.#}pt";
         var mT = $"{pg.MarginTopPt:0.#}pt";
         var mB = $"{pg.MarginBottomPt:0.#}pt";
+        // MOD(#11): see cove-desktop-mods.md
+        // OOXML page header/footer distances are measured from the physical
+        // page edge. `.page` already models the full sheet with page padding
+        // for the body margins, so subtracting body margins here pushes the
+        // header/footer outside the white page box and makes them disappear in
+        // embedded preview iframes.
+        var headerTop = $"{pg.HeaderDistancePt:0.#}pt";
+        var footerBottom = $"{pg.FooterDistancePt:0.#}pt";
         // Build font fallback chain: document font → platform-specific CJK equivalents → generic
         var docFont = CssSanitize(dd.Font);
         var cjkFallback = GetCjkFontFallback(docFont, _eastAsiaLang, _themeCjkFont);
@@ -1384,6 +1420,9 @@ public partial class WordHandler
         var sz = $"{dd.SizePt:0.##}pt";
         // Use docGrid linePitch as line-height when available (CJK snap-to-grid)
         var lh = dd.GridLinePitchPt > 0 ? $"{dd.GridLinePitchPt:0.##}pt" : $"{dd.LineHeight:0.##}";
+        var pLineHeightPt = Math.Max(
+            dd.SizePt * dd.LineHeight * FontMetricsReader.GetRatio(dd.Font),
+            dd.GridLinePitchPt > 0 ? dd.GridLinePitchPt : 0);
 
         return $@"
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -1407,12 +1446,14 @@ public partial class WordHandler
         mark[data-id] {{ background: #fef9c3; padding: 0 1px; }}
         aside[data-type=""comments""] {{ display: none; }}
         .doc-header, .doc-footer {{ font-size: {dd.SizePt:0.##}pt; }}
-        .doc-header {{ position: absolute; top: {pg.HeaderDistancePt:0.#}pt; left: {mL}; right: {mR};
+        .doc-header {{ position: absolute; top: {headerTop}; left: 0; right: 0;
+            padding-left: {mL}; padding-right: {mR};
             padding-bottom: 0.3em; }}
-        .doc-footer {{ position: absolute; bottom: {pg.FooterDistancePt:0.#}pt; left: {mL}; right: {mR};
+        .doc-footer {{ position: absolute; bottom: {footerBottom}; left: 0; right: 0;
+            padding-left: {mL}; padding-right: {mR};
             padding-top: 0.3em; }}
         h1, h2, h3, h4, h5, h6 {{ line-height: normal; }}
-        p {{ margin: 0; margin-bottom: {(dd.SpaceAfterPt > 0 ? $"{dd.SpaceAfterPt:0.##}pt" : "0")}; line-height: {dd.LineHeight * FontMetricsReader.GetRatio(dd.Font):0.##}; text-align: {dd.DefaultAlign};{(dd.DefaultAlign == "justify" ? " text-justify: inter-character;" : "")} text-autospace: ideograph-alpha ideograph-numeric; }}
+        p {{ margin: 0; margin-bottom: {(dd.SpaceAfterPt > 0 ? $"{dd.SpaceAfterPt:0.##}pt" : "0")}; line-height: {pLineHeightPt:0.##}pt; text-align: {dd.DefaultAlign};{(dd.DefaultAlign == "justify" ? " text-justify: inter-character;" : "")} text-autospace: ideograph-alpha ideograph-numeric; }}
         p.empty {{ margin: 0; min-height: 1em; }}
         a {{ color: #2B579A; }} a:hover {{ color: #1a3c6e; }}
         .toc {{ display: flex; text-indent: 0 !important; }}
