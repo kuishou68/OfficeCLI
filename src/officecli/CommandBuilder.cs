@@ -125,7 +125,6 @@ static partial class CommandBuilder
         rootCommand.Add(BuildRawSetCommand(jsonOption));
         rootCommand.Add(BuildAddPartCommand(jsonOption));
         rootCommand.Add(BuildValidateCommand(jsonOption));
-        rootCommand.Add(BuildCheckCommand(jsonOption));
         rootCommand.Add(BuildBatchCommand(jsonOption));
         rootCommand.Add(BuildImportCommand(jsonOption));
         rootCommand.Add(BuildCreateCommand(jsonOption));
@@ -171,12 +170,20 @@ static partial class CommandBuilder
         // spawning, then restore.  This prevents the shell's pipe handles
         // from leaking into the resident while still allowing .NET's internal
         // handle plumbing to work.
+        //
+        // On macOS/Linux, posix_spawn inherits fds unless the child's
+        // stdout/stderr are explicitly redirected.  RedirectStandardOutput /
+        // RedirectStandardError = true makes .NET plumb a fresh pipe from
+        // parent to child, so the caller's shell pipe (e.g. `| tail -1`,
+        // $(...)) is NOT inherited and EOFs promptly when the client exits.
+        // See ResidentStdoutInheritanceTests for the regression lock-in.
         var startInfo = new ProcessStartInfo
         {
             FileName = exePath,
             Arguments = $"__resident-serve__ \"{filePath}\"",
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
             RedirectStandardError = true
         };
 
@@ -273,6 +280,15 @@ static partial class CommandBuilder
 
     internal static int? TryResident(string filePath, Action<ResidentRequest> configure, bool json = false)
     {
+        // MOD(#8): see docs/cove-desktop-mods.md
+        // Some embedders need specific commands (notably read-heavy query/view)
+        // to bypass any existing resident entirely instead of probing/reusing it.
+        // This skips both "reuse running resident" and "auto-start resident" so
+        // the caller falls through to direct file access.
+        var skipResident = Environment.GetEnvironmentVariable("OFFICECLI_SKIP_RESIDENT");
+        if (skipResident == "1" || string.Equals(skipResident, "true", StringComparison.OrdinalIgnoreCase))
+            return null;
+
         // Step 1: does a resident own this file? Probe via the -ping pipe,
         // which is never serialized behind main-pipe commands.
         if (!ResidentClient.TryConnect(filePath, out _))
@@ -292,6 +308,14 @@ static partial class CommandBuilder
                 if (!ResidentClient.TryConnect(filePath, out _))
                     return null; // truly no resident → caller falls back to direct file access
             }
+            // Intentionally no user-facing hint here. UX testing with an AI
+            // agent showed a standalone "background process" hint on a random
+            // mid-batch command (e.g. `get`) creates low-grade anxiety without
+            // giving the caller a concrete action — auto-close in 60s already
+            // handles the cleanup, and other officecli commands work normally
+            // through the resident regardless. The `create` command keeps a
+            // small inline suffix on its success line because it's contextual
+            // to a freshly-created file, not a nag fired from anywhere.
         }
 
         var request = new ResidentRequest();
@@ -1062,12 +1086,16 @@ static partial class CommandBuilder
     /// Check if a shape's text overflows its bounds using CJK-aware character measurement.
     /// Returns a warning message or null.
     /// </summary>
-    private static string? CheckTextOverflow(IDocumentHandler handler, string path)
+    internal static string? CheckTextOverflow(IDocumentHandler handler, string path)
     {
-        if (handler is not OfficeCli.Handlers.PowerPointHandler pptHandler) return null;
         try
         {
-            return pptHandler.CheckShapeTextOverflow(path);
+            return handler switch
+            {
+                OfficeCli.Handlers.PowerPointHandler ppt => ppt.CheckShapeTextOverflow(path),
+                OfficeCli.Handlers.ExcelHandler xl => xl.CheckCellOverflow(path),
+                _ => null
+            };
         }
         catch { return null; }
     }
@@ -1078,6 +1106,8 @@ static partial class CommandBuilder
     /// </summary>
     private static void NotifyWatch(IDocumentHandler handler, string filePath, string? changedPath)
     {
+        if (!WatchServer.IsWatching(filePath)) return;
+
         if (handler is OfficeCli.Handlers.ExcelHandler excel)
         {
             string? scrollTo = null;
@@ -1115,6 +1145,8 @@ static partial class CommandBuilder
 
     private static void NotifyWatchRoot(IDocumentHandler handler, string filePath, int oldSlideCount)
     {
+        if (!WatchServer.IsWatching(filePath)) return;
+
         if (handler is OfficeCli.Handlers.ExcelHandler excel)
         {
             WatchNotifier.NotifyIfWatching(filePath, new WatchMessage { Action = "full", FullHtml = excel.ViewAsHtml() });

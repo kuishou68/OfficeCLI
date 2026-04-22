@@ -4,18 +4,43 @@
 namespace OfficeCli.Core;
 
 /// <summary>
-/// Lightweight TTF/TTC font metrics reader. Reads only the OS/2 and head tables
-/// to extract usWinAscent, usWinDescent, and unitsPerEm — enough to calculate
-/// the line-height ratio that Word uses for line spacing.
+/// Lightweight TTF/TTC font metrics reader. Reads OS/2, hhea, and head tables
+/// to extract usWinAscent, usWinDescent, hheaLineGap, and unitsPerEm —
+/// enough to calculate the line-height ratio for CSS rendering.
 ///
-/// Word line spacing formula: actualLineHeight = (winAscent + winDescent) / UPM × fontSize × multiplier
-/// CSS line-height is relative to fontSize, so: cssLineHeight = wordMultiplier × ratio
-/// where ratio = (winAscent + winDescent) / UPM
+/// ratio = (winAscent + winDescent + hheaLineGap) / UPM
+/// CSS line-height = lineSpacingMultiplier × ratio
 /// </summary>
 internal static class FontMetricsReader
 {
+    // MOD(#12): see docs/cove-desktop-mods.md
+    // Word documents often specify Windows logical CJK family names such as
+    // "宋体" / "黑体", while macOS ships the actual font files under stems like
+    // Songti.ttc / STHeiti.ttc. Metrics lookup must follow the same alias/fallback
+    // path as the preview CSS, otherwise GetRatio() falls back to 1.0 and the
+    // rendered line-height becomes much tighter than the browser's real glyph box.
+    private static readonly Dictionary<string, string[]> s_fontSearchAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["宋体"] = ["Songti", "Songti SC", "STSong", "SimSun", "NSimSun"],
+        ["宋体-简"] = ["Songti", "Songti SC", "STSong"],
+        ["宋體-簡"] = ["Songti", "Songti SC", "STSong"],
+        ["SimSun"] = ["Songti", "Songti SC", "STSong", "宋体"],
+        ["NSimSun"] = ["Songti", "Songti SC", "STSong", "宋体"],
+        ["黑体"] = ["STHeiti", "Heiti SC", "Heiti TC", "SimHei"],
+        ["SimHei"] = ["STHeiti", "Heiti SC", "Heiti TC", "黑体"],
+        ["仿宋_GB2312"] = ["STFangsong", "FangSong", "仿宋"],
+        ["仿宋"] = ["STFangsong", "FangSong", "仿宋_GB2312"],
+        ["楷体_GB2312"] = ["STKaiti", "KaiTi", "楷体"],
+        ["楷体"] = ["STKaiti", "KaiTi", "楷体_GB2312"],
+        ["长城小标宋体"] = ["STZhongsong", "Songti", "STSong"],
+        ["Songti SC"] = ["Songti", "STSong", "宋体"],
+        ["STSong"] = ["Songti", "Songti SC", "宋体"],
+        ["Heiti SC"] = ["STHeiti", "黑体"],
+        ["STHeiti"] = ["Heiti SC", "黑体"],
+    };
+
     /// <summary>
-    /// Line-height ratio = (usWinAscent + usWinDescent) / unitsPerEm.
+    /// Line-height ratio = (usWinAscent + usWinDescent + hheaLineGap) / unitsPerEm.
     /// Returns 1.0 if the font file cannot be read.
     /// </summary>
     public static double GetLineHeightRatio(string fontFilePath, int fontIndex = 0)
@@ -41,19 +66,15 @@ internal static class FontMetricsReader
             var winDescent = ReadUInt16BE(reader);
             var winTotal = (double)(winAscent + winDescent);
 
-            // hhea table: ascent at offset 4, descent at offset 6 (int16), lineGap at offset 8 (int16)
-            // Chrome uses: max(winAscent+winDescent, hheaAscent+|hheaDescent|+hheaLineGap) / UPM
-            double hheaTotal = 0;
+            // Include hhea lineGap in the ratio for accurate line height.
+            int hheaLineGap = 0;
             if (hheaOffset >= 0)
             {
-                fs.Position = hheaOffset + 4;
-                var hheaAscent = ReadInt16BE(reader);
-                var hheaDescent = ReadInt16BE(reader);
-                var hheaLineGap = ReadInt16BE(reader);
-                hheaTotal = hheaAscent + Math.Abs(hheaDescent) + Math.Max(0, (int)hheaLineGap);
+                fs.Position = hheaOffset + 8; // lineGap at hhea offset 8 (int16)
+                hheaLineGap = Math.Max(0, (int)ReadInt16BE(reader));
             }
 
-            return Math.Max(winTotal, hheaTotal) / upm;
+            return (winTotal + hheaLineGap) / upm;
         }
         catch
         {
@@ -157,8 +178,12 @@ internal static class FontMetricsReader
             dirs.Add("/usr/local/share/fonts");
         }
 
-        // Normalize: remove spaces, try exact match and lowercase
-        var normalized = fontFamily.Replace(" ", "");
+        // Normalize: remove spaces, try exact match and platform fallback aliases.
+        var candidates = ExpandFontSearchAliases(fontFamily)
+            .Select(NormalizeFontSearchToken)
+            .Where(token => !string.IsNullOrWhiteSpace(token))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         foreach (var dir in dirs)
         {
             if (!Directory.Exists(dir)) continue;
@@ -166,14 +191,30 @@ internal static class FontMetricsReader
             {
                 var ext = Path.GetExtension(file);
                 if (ext is not (".ttf" or ".otf" or ".ttc")) continue;
-                var stem = Path.GetFileNameWithoutExtension(file);
-                if (stem.Equals(normalized, StringComparison.OrdinalIgnoreCase)
-                    || stem.Equals(fontFamily, StringComparison.OrdinalIgnoreCase))
+                var stem = NormalizeFontSearchToken(Path.GetFileNameWithoutExtension(file));
+                if (candidates.Any(candidate => stem.Equals(candidate, StringComparison.OrdinalIgnoreCase)))
                     return file;
             }
         }
         return null;
     }
+
+    private static IEnumerable<string> ExpandFontSearchAliases(string fontFamily)
+    {
+        yield return fontFamily;
+
+        if (s_fontSearchAliases.TryGetValue(fontFamily, out var aliases))
+        {
+            foreach (var alias in aliases)
+                yield return alias;
+        }
+    }
+
+    private static string NormalizeFontSearchToken(string value) =>
+        value
+            .Replace(" ", "", StringComparison.Ordinal)
+            .Replace("-", "", StringComparison.Ordinal)
+            .Replace("_", "", StringComparison.Ordinal);
 
     // ==================== Cached Ratio Lookup ====================
 
@@ -199,8 +240,8 @@ internal static class FontMetricsReader
     /// <summary>
     /// Get CSS ascent-override and descent-override percentages for a font.
     /// These tell the browser to distribute line-height space according to
-    /// the font's ascent/descent ratio (matching Word's behavior) instead of
-    /// the CSS default half-leading model.
+    /// the font's OS/2 ascent/descent ratio instead of the CSS default
+    /// half-leading model.
     /// Returns (0, 0) if the font cannot be found.
     /// </summary>
     public static (double ascentPct, double descentPct) GetAscentDescentOverride(string fontFamily)

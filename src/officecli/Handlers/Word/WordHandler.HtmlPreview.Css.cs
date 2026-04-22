@@ -17,12 +17,46 @@ public partial class WordHandler
 {
     private Dictionary<string, string>? _themeColors;
 
+    // Microsoft Office default "Office" theme palette. When a document has
+    // no <a:theme> part (blank docs created via BlankDocCreator), Word
+    // applies this palette; our HTML preview now does the same so
+    // w:themeColor="accent1" resolves instead of silently dropping.
+    private static readonly Dictionary<string, string> OfficeDefaultThemeColors = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["accent1"] = "4472C4",
+        ["accent2"] = "ED7D31",
+        ["accent3"] = "A5A5A5",
+        ["accent4"] = "FFC000",
+        ["accent5"] = "5B9BD5",
+        ["accent6"] = "70AD47",
+        ["dark1"] = "000000", ["tx1"] = "000000", ["dk1"] = "000000", ["text1"] = "000000",
+        ["dark2"] = "44546A", ["tx2"] = "44546A", ["dk2"] = "44546A", ["text2"] = "44546A",
+        ["light1"] = "FFFFFF", ["bg1"] = "FFFFFF", ["lt1"] = "FFFFFF", ["background1"] = "FFFFFF",
+        ["light2"] = "E7E6E6", ["bg2"] = "E7E6E6", ["lt2"] = "E7E6E6", ["background2"] = "E7E6E6",
+        ["hyperlink"] = "0563C1",
+        ["followedHyperlink"] = "954F72",
+    };
+
     private Dictionary<string, string> GetThemeColors()
     {
         if (_themeColors != null) return _themeColors;
 
-        var colorScheme = _doc.MainDocumentPart?.ThemePart?.Theme?.ThemeElements?.ColorScheme;
+        // A malformed theme1.xml (any XML error) throws XmlException on
+        // lazy access deep inside the first reader. Fall back to the Office
+        // default palette rather than tainting the whole preview. Same
+        // approach used for styles/footnotes below.
+        DocumentFormat.OpenXml.Drawing.ColorScheme? colorScheme = null;
+        try { colorScheme = _doc.MainDocumentPart?.ThemePart?.Theme?.ThemeElements?.ColorScheme; }
+        catch (System.Xml.XmlException) { }
         _themeColors = ThemeColorResolver.BuildColorMap(colorScheme, includePptAliases: false);
+
+        // Fill in any missing standard names from the Office default theme so
+        // themeColor references resolve even when the docx has no theme part.
+        foreach (var (name, hex) in OfficeDefaultThemeColors)
+        {
+            if (!_themeColors.ContainsKey(name))
+                _themeColors[name] = hex;
+        }
         return _themeColors;
     }
 
@@ -68,13 +102,51 @@ public partial class WordHandler
             if (rgb != null)
             {
                 var val = rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
-                if (val != null) return $"background-color:#{val}";
+                if (val != null && IsHexColor(val)) return $"background-color:#{val}";
             }
             var scheme = solidFill.Elements().FirstOrDefault(e => e.LocalName == "schemeClr");
             if (scheme != null)
             {
                 var color = ResolveSchemeColor(scheme);
                 if (color != null) return $"background-color:{color}";
+            }
+        }
+
+        // Gradient fill → CSS linear-gradient. OOXML stores stops as <a:gsLst>
+        // with each <a:gs pos="N"/> (in 1/1000 of a percent). Direction comes
+        // from <a:lin ang="N"/> (in 60000ths of a degree).
+        var gradFill = spPr.Elements().FirstOrDefault(e => e.LocalName == "gradFill");
+        if (gradFill != null)
+        {
+            var gsLst = gradFill.Elements().FirstOrDefault(e => e.LocalName == "gsLst");
+            if (gsLst != null)
+            {
+                var stops = new List<string>();
+                foreach (var gs in gsLst.Elements().Where(e => e.LocalName == "gs"))
+                {
+                    var posAttr = gs.GetAttributes().FirstOrDefault(a => a.LocalName == "pos").Value;
+                    double pct = int.TryParse(posAttr, out var posVal) ? posVal / 1000.0 : 0;
+                    string? color = null;
+                    var gsRgb = gs.Elements().FirstOrDefault(e => e.LocalName == "srgbClr");
+                    if (gsRgb != null)
+                        color = "#" + gsRgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
+                    var gsScheme = gs.Elements().FirstOrDefault(e => e.LocalName == "schemeClr");
+                    if (gsScheme != null) color = ResolveSchemeColor(gsScheme);
+                    if (color != null)
+                        stops.Add($"{color} {pct:0.##}%");
+                }
+                if (stops.Count > 0)
+                {
+                    // ang: 60000ths of a degree; CSS linear-gradient uses "to <dir>" or "<deg>"
+                    // OOXML 0 = left→right; CSS 0deg = bottom→top. Convert OOXML → CSS:
+                    // CSS angle = (OOXML angle / 60000 + 90) % 360
+                    var lin = gradFill.Elements().FirstOrDefault(e => e.LocalName == "lin");
+                    double cssAngleDeg = 90;
+                    var angAttr = lin?.GetAttributes().FirstOrDefault(a => a.LocalName == "ang").Value;
+                    if (long.TryParse(angAttr, out var angVal))
+                        cssAngleDeg = (angVal / 60000.0 + 90) % 360;
+                    return $"background:linear-gradient({cssAngleDeg:0.##}deg,{string.Join(",", stops)})";
+                }
             }
         }
 
@@ -93,7 +165,10 @@ public partial class WordHandler
 
         string? color = null;
         var rgb = solidFill.Elements().FirstOrDefault(e => e.LocalName == "srgbClr");
-        if (rgb != null) color = $"#{rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value}";
+        if (rgb != null) {
+            var rv = rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
+            if (rv != null && IsHexColor(rv)) color = $"#{rv}";
+        }
         var scheme = solidFill.Elements().FirstOrDefault(e => e.LocalName == "schemeClr");
         if (scheme != null) color = ResolveSchemeColor(scheme);
 
@@ -150,6 +225,7 @@ public partial class WordHandler
     private string GetParagraphInlineCss(Paragraph para, bool isListItem = false)
     {
         var parts = new List<string>();
+        var docDefaults = ReadDocDefaults();
 
         // Set paragraph font-size to match the first run's resolved font-size.
         // This prevents the CSS "strut" (block container's anonymous inline box) from inflating
@@ -168,6 +244,8 @@ public partial class WordHandler
         if (pProps == null)
         {
             var styleCss = ResolveParagraphStyleCss(para);
+            if (!styleCss.Contains("line-height:", StringComparison.Ordinal))
+                parts.Add(BuildDefaultParagraphLineHeightCss(para, null, docDefaults));
             if (parts.Count > 0 && !string.IsNullOrEmpty(styleCss))
                 return string.Join(";", parts) + ";" + styleCss;
             if (parts.Count > 0) return string.Join(";", parts);
@@ -178,19 +256,24 @@ public partial class WordHandler
         var styleId = pProps.ParagraphStyleId?.Val?.Value;
 
         // Alignment (direct or from style chain)
-        var jc = pProps.Justification?.Val;
-        if (jc == null) jc = ResolveJustificationFromStyle(styleId);
-        if (jc != null)
+        var jc = pProps.Justification?.Val?.InnerText;
+        if (string.IsNullOrWhiteSpace(jc)) jc = ResolveJustificationFromStyle(styleId);
+        if (!string.IsNullOrWhiteSpace(jc))
         {
-            var align = jc.InnerText switch
-            {
-                "center" => "center",
-                "right" or "end" => "right",
-                "both" or "distribute" => "justify",
-                _ => (string?)null
-            };
+            var jcVal = jc.Trim();
+            var align = MapJustificationToCss(jcVal);
             if (align != null) parts.Add($"text-align:{align}");
+            // w:jc="distribute" stretches EVERY line (including single/last)
+            // to full width with inter-character spacing. Plain CSS justify
+            // leaves the last line unstretched, so add text-align-last
+            // and text-justify hints for closer fidelity.
+            if (jcVal.Equals("distribute", StringComparison.OrdinalIgnoreCase))
+                parts.Add("text-align-last:justify;text-justify:inter-character");
         }
+
+        // Paragraph-level RTL (w:bidi) — flips the paragraph direction
+        if (pProps.BiDi != null && (pProps.BiDi.Val == null || pProps.BiDi.Val.Value))
+            parts.Add("direction:rtl");
 
         // Drop cap detection — used to suppress text-indent
         var framePrForIndent = pProps.GetFirstChild<FrameProperties>();
@@ -208,16 +291,29 @@ public partial class WordHandler
             var indFirstLine = directInd?.FirstLine?.Value ?? styleInd?.FirstLine?.Value;
             var indHanging = directInd?.Hanging?.Value ?? styleInd?.Hanging?.Value;
 
+            // Hanging indent needs left padding/margin equal to the hanging
+            // amount to produce the visual effect (first line at 0, follow
+            // lines indented). When only `hanging` is set without `left`,
+            // use hanging as the left margin too.
+            double? hangPt = null;
+            if (indHanging is string hpTwips && hpTwips != "0")
+                hangPt = Units.TwipsToPt(hpTwips);
+            double leftPt = 0;
             if (indLeft is string leftTwips && leftTwips != "0")
-                parts.Add($"margin-left:{Units.TwipsToPt(leftTwips):0.##}pt");
+                leftPt = Units.TwipsToPt(leftTwips);
+            // When hanging is set and left is 0, promote hanging into left
+            // margin so subsequent lines visibly indent.
+            if (hangPt.HasValue && leftPt == 0) leftPt = hangPt.Value;
+            if (leftPt != 0)
+                parts.Add($"margin-left:{leftPt:0.##}pt");
             if (indRight is string rightTwips && rightTwips != "0")
                 parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
             if (!hasDropCap)
             {
                 if (indFirstLine is string firstLineTwips && firstLineTwips != "0")
                     parts.Add($"text-indent:{Units.TwipsToPt(firstLineTwips):0.##}pt");
-                if (indHanging is string hangTwips && hangTwips != "0")
-                    parts.Add($"text-indent:-{Units.TwipsToPt(hangTwips):0.##}pt");
+                if (hangPt.HasValue)
+                    parts.Add($"text-indent:-{hangPt.Value:0.##}pt");
             }
         }
 
@@ -235,13 +331,51 @@ public partial class WordHandler
 
         if (spacing != null)
         {
+            // contextualSpacing: when enabled and adjacent paragraph has the same style,
+            // spaceBefore/spaceAfter between them is suppressed (set to zero).
+            var hasContextualSpacing = pProps.ContextualSpacing != null
+                || ResolveContextualSpacingFromStyle(styleId);
+            var prevPara = para.PreviousSibling<Paragraph>();
+            var nextPara = para.NextSibling<Paragraph>();
+            var prevStyleId = prevPara?.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
+            var nextStyleId = nextPara?.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
+            bool suppressBefore = hasContextualSpacing && prevPara != null
+                && (prevStyleId ?? "") == (styleId ?? "");
+            bool suppressAfter = hasContextualSpacing && nextPara != null
+                && (nextStyleId ?? "") == (styleId ?? "");
+
             // Before: try direct, then style fallback (before in twips, beforeLines in hundredths of a line)
             var beforeVal = pProps.SpacingBetweenLines?.Before?.Value
                             ?? styleSpacing?.Before?.Value;
             var beforeLinesVal = pProps.SpacingBetweenLines?.BeforeLines?.Value
                                  ?? styleSpacing?.BeforeLines?.Value;
-            if (beforeVal is string beforeTwips)
-                parts.Add($"{vSpacingPropBefore}:{Units.TwipsToPt(beforeTwips):0.##}pt");
+
+            // Word collapses adjacent spaceBefore/spaceAfter: max(prev.after, cur.before)
+            // instead of adding them. CSS flexbox doesn't collapse margins, so we subtract
+            // the overlap from spaceBefore when the previous sibling has spaceAfter.
+            double prevSpaceAfterPt = 0;
+            if (prevPara != null && !suppressBefore)
+            {
+                var prevPProps = prevPara.ParagraphProperties;
+                var prevSId = prevPProps?.ParagraphStyleId?.Val?.Value;
+                var prevStyleSpacing = ResolveSpacingFromStyle(prevSId);
+                var prevAfter = prevPProps?.SpacingBetweenLines?.After?.Value
+                                ?? prevStyleSpacing?.After?.Value;
+                if (prevAfter is string pa && int.TryParse(pa, out var paTwips))
+                    prevSpaceAfterPt = paTwips / 20.0;
+            }
+
+            if (suppressBefore)
+                parts.Add($"{vSpacingPropBefore}:0");
+            else if (beforeVal is string beforeTwips)
+            {
+                double beforePt = Units.TwipsToPt(beforeTwips);
+                // Collapse: effective spaceBefore = max(0, spaceBefore - prevSpaceAfter)
+                if (prevSpaceAfterPt > 0)
+                    beforePt = Math.Max(0, beforePt - prevSpaceAfterPt);
+                if (beforePt > 0)
+                    parts.Add($"{vSpacingPropBefore}:{beforePt:0.##}pt");
+            }
             else if (beforeLinesVal is int beforeLines)
                 parts.Add($"{vSpacingPropBefore}:{beforeLines / 100.0:0.##}em");
 
@@ -250,43 +384,31 @@ public partial class WordHandler
                            ?? styleSpacing?.After?.Value;
             var afterLinesVal = pProps.SpacingBetweenLines?.AfterLines?.Value
                                 ?? styleSpacing?.AfterLines?.Value;
-            if (afterVal is string afterTwips)
+            if (suppressAfter)
+                parts.Add($"{vSpacingPropAfter}:0");
+            else if (afterVal is string afterTwips)
                 parts.Add($"{vSpacingPropAfter}:{Units.TwipsToPt(afterTwips):0.##}pt");
             else if (afterLinesVal is int afterLines)
                 parts.Add($"{vSpacingPropAfter}:{afterLines / 100.0:0.##}em");
-
-            // Line: try direct, then style fallback
             var lineVal = pProps.SpacingBetweenLines?.Line?.Value
                           ?? styleSpacing?.Line?.Value;
-            if (lineVal is string lv)
-            {
-                var rule = pProps.SpacingBetweenLines?.LineRule?.InnerText
+            var lineRule = pProps.SpacingBetweenLines?.LineRule?.InnerText
                            ?? styleSpacing?.LineRule?.InnerText;
-                if (rule == "auto" || rule == null)
-                {
-                    if (int.TryParse(lv, out var lvNum))
-                    {
-                        // Correct for font metrics: Word uses (winAscent+winDescent)/UPM as base
-                        var paraFont = ResolveParaFontForLineHeight(para);
-                        var ratio = FontMetricsReader.GetRatio(paraFont);
-                        parts.Add($"line-height:{lvNum / 240.0 * ratio:0.##}");
-                    }
-                }
-                else if (rule == "exact" || rule == "atLeast")
-                {
-                    parts.Add($"line-height:{Units.TwipsToPt(lv):0.##}pt");
-                }
-            }
-
-            // If no explicit line-height was set, use font metrics ratio
-            if (!parts.Any(p => p.StartsWith("line-height")))
+            if (lineRule == "exact" && lineVal is string exactLine)
             {
-                var paraFont = ResolveParaFontForLineHeight(para);
-                var ratio = FontMetricsReader.GetRatio(paraFont);
-                if (ratio > 1.01 || ratio < 0.99) // only if meaningfully different from 1.0
-                    parts.Add($"line-height:{ratio:0.##}");
+                var linePt = Units.TwipsToPt(exactLine);
+                var paraFontSizePt = ResolveParaFontSizePt(para, docDefaults);
+                if (paraFontSizePt > 0 && linePt < paraFontSizePt * 1.2)
+                    parts.Add("overflow:hidden");
             }
         }
+
+        // MOD(#6): see cove-desktop-mods.md
+        // Always emit an inline line-height derived from the paragraph's
+        // effective spacing + actual font metrics. This path also folds in the
+        // section docGrid linePitch when the body text snaps to grid, so WPS /
+        // Word previews do not collapse back to the browser's tighter default.
+        parts.Add(BuildDefaultParagraphLineHeightCss(para, styleSpacing, docDefaults));
 
         // Shading / background (direct or from style)
         var shading = pProps.Shading;
@@ -353,6 +475,75 @@ public partial class WordHandler
         return string.Join(";", parts);
     }
 
+    private string BuildDefaultParagraphLineHeightCss(
+        Paragraph para,
+        SpacingBetweenLines? styleSpacing,
+        DocDef docDefaults)
+    {
+        var lineVal = para.ParagraphProperties?.SpacingBetweenLines?.Line?.Value
+            ?? styleSpacing?.Line?.Value;
+        var rule = para.ParagraphProperties?.SpacingBetweenLines?.LineRule?.InnerText
+            ?? styleSpacing?.LineRule?.InnerText;
+        var paraFont = ResolveParaFontForLineHeight(para);
+        var ratio = FontMetricsReader.GetRatio(paraFont);
+        var paraFontSizePt = ResolveParaFontSizePt(para, docDefaults);
+
+        if (lineVal is string explicitLine)
+        {
+            if ((rule == "auto" || rule == null) && int.TryParse(explicitLine, out var autoLine))
+            {
+                var autoLineHeightPt = paraFontSizePt * (autoLine / 240.0) * ratio;
+                autoLineHeightPt = ClampBodyParagraphToDocGrid(para, autoLineHeightPt, docDefaults);
+                return $"line-height:{autoLineHeightPt:0.##}pt";
+            }
+            if (rule == "exact" || rule == "atLeast")
+                return $"line-height:{Units.TwipsToPt(explicitLine):0.##}pt";
+        }
+
+        var defaultLineHeightPt = paraFontSizePt * docDefaults.LineHeight * ratio;
+        defaultLineHeightPt = ClampBodyParagraphToDocGrid(para, defaultLineHeightPt, docDefaults);
+        return $"line-height:{defaultLineHeightPt:0.##}pt";
+    }
+
+    private double ResolveParaFontSizePt(Paragraph para, DocDef docDefaults)
+    {
+        var firstRun = para.Elements<Run>().FirstOrDefault(r =>
+            r.ChildElements.Any(c => c is Text t && !string.IsNullOrEmpty(t.Text)));
+        if (firstRun != null)
+        {
+            var rProps = ResolveEffectiveRunProperties(firstRun, para);
+            if (rProps.FontSize?.Val?.Value is string runSize && double.TryParse(runSize, out var halfPts))
+                return halfPts / 2.0;
+        }
+
+        var styleId = para.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
+        if (!string.IsNullOrWhiteSpace(styleId))
+        {
+            var styleFontSize = ResolveStyleFontSize(styleId);
+            if (!string.IsNullOrWhiteSpace(styleFontSize)
+                && styleFontSize.EndsWith("pt", StringComparison.OrdinalIgnoreCase)
+                && double.TryParse(styleFontSize[..^2], out var stylePt))
+                return stylePt;
+        }
+
+        return docDefaults.SizePt;
+    }
+
+    private double ClampBodyParagraphToDocGrid(Paragraph para, double lineHeightPt, DocDef docDefaults)
+    {
+        // MOD(#11): see cove-desktop-mods.md
+        // Section docGrid linePitch is measured from the page edge grid, not
+        // from the browser's anonymous line box. When preview paragraphs emit
+        // their own inline line-height they override the page-level grid
+        // fallback, so we clamp body text here to keep the rendered baseline
+        // spacing aligned with WPS / Word.
+        if (_ctx?.RenderingHeaderFooter == true) return lineHeightPt;
+        var snapToGrid = para.ParagraphProperties?.SnapToGrid?.Val?.Value ?? true;
+        return snapToGrid && docDefaults.GridLinePitchPt > 0
+            ? Math.Max(lineHeightPt, docDefaults.GridLinePitchPt)
+            : lineHeightPt;
+    }
+
     /// <summary>
     /// Resolve paragraph background shading from the style chain.
     /// </summary>
@@ -381,7 +572,7 @@ public partial class WordHandler
     /// <summary>
     /// Resolve Justification from the style chain.
     /// </summary>
-    private JustificationValues? ResolveJustificationFromStyle(string? styleId)
+    private string? ResolveJustificationFromStyle(string? styleId)
     {
         if (styleId == null) return null;
         var visited = new HashSet<string>();
@@ -391,11 +582,22 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var jc = style.StyleParagraphProperties?.Justification?.Val;
-            if (jc != null) return jc;
+            var jc = style.StyleParagraphProperties?.Justification?.Val?.InnerText;
+            if (!string.IsNullOrWhiteSpace(jc)) return jc;
             currentStyleId = style.BasedOn?.Val?.Value;
         }
         return null;
+    }
+
+    private static string? MapJustificationToCss(string? jc)
+    {
+        return jc?.Trim().ToLowerInvariant() switch
+        {
+            "center" => "center",
+            "right" or "end" => "right",
+            "both" or "distribute" => "justify",
+            _ => null
+        };
     }
 
     /// <summary>
@@ -447,14 +649,64 @@ public partial class WordHandler
 
     private SpacingBetweenLines? ResolveSpacingFromStyle(string? styleId)
     {
+        // MOD(#6): see cove-desktop-mods.md
+        // Merge spacing property-by-property across the style chain and
+        // docDefaults instead of returning the first <w:spacing> node we hit.
+        // Many docs split before/after/line across different levels; stopping
+        // early loses inherited values and causes preview spacing drift.
+        var merged = new SpacingBetweenLines();
+
+        void MergeSpacing(SpacingBetweenLines? source)
+        {
+            if (source == null) return;
+            merged.Before ??= source.Before?.Value;
+            merged.BeforeLines ??= source.BeforeLines?.Value;
+            merged.After ??= source.After?.Value;
+            merged.AfterLines ??= source.AfterLines?.Value;
+            merged.Line ??= source.Line?.Value;
+            merged.LineRule ??= source.LineRule?.Value;
+        }
+
         // If no explicit style, use the default paragraph style (Normal)
         if (styleId == null)
         {
             var defaultStyle = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.Type?.Value == StyleValues.Paragraph && s.Default?.Value == true);
-            if (defaultStyle?.StyleParagraphProperties?.SpacingBetweenLines != null)
-                return defaultStyle.StyleParagraphProperties.SpacingBetweenLines;
-            return null;
+            MergeSpacing(defaultStyle?.StyleParagraphProperties?.SpacingBetweenLines);
+        }
+
+        var visited = new HashSet<string>();
+        var currentStyleId = styleId;
+        while (currentStyleId != null && visited.Add(currentStyleId))
+        {
+            var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+                ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
+            if (style == null) break;
+            MergeSpacing(style.StyleParagraphProperties?.SpacingBetweenLines);
+            currentStyleId = style.BasedOn?.Val?.Value;
+        }
+
+        MergeSpacing(_doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+            ?.DocDefaults?.ParagraphPropertiesDefault?.ParagraphPropertiesBaseStyle?.SpacingBetweenLines);
+
+        return merged.Before != null
+            || merged.BeforeLines != null
+            || merged.After != null
+            || merged.AfterLines != null
+            || merged.Line != null
+            || merged.LineRule != null
+            ? merged
+            : null;
+    }
+
+    /// <summary>Resolve contextualSpacing from the style chain.</summary>
+    private bool ResolveContextualSpacingFromStyle(string? styleId)
+    {
+        if (styleId == null)
+        {
+            var defaultStyle = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+                ?.Elements<Style>().FirstOrDefault(s => s.Type?.Value == StyleValues.Paragraph && s.Default?.Value == true);
+            return defaultStyle?.StyleParagraphProperties?.ContextualSpacing != null;
         }
         var visited = new HashSet<string>();
         var currentStyleId = styleId;
@@ -463,11 +715,10 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var sp = style.StyleParagraphProperties?.SpacingBetweenLines;
-            if (sp != null) return sp;
+            if (style.StyleParagraphProperties?.ContextualSpacing != null) return true;
             currentStyleId = style.BasedOn?.Val?.Value;
         }
-        return null;
+        return false;
     }
 
     /// <summary>
@@ -475,11 +726,27 @@ public partial class WordHandler
     /// </summary>
     private Indentation? ResolveIndentationFromStyle(string? styleId)
     {
+        // MOD(#7): see cove-desktop-mods.md
+        // Merge indentation property-by-property across the style chain and
+        // docDefaults instead of returning the first <w:ind> node we hit.
+        // WPS-authored docs often split left/right/firstLine across basedOn
+        // levels; stopping early loses inherited paragraph margins.
+        var merged = new Indentation();
+
+        void MergeIndentation(Indentation? source)
+        {
+            if (source == null) return;
+            merged.Left ??= source.Left?.Value;
+            merged.Right ??= source.Right?.Value;
+            merged.FirstLine ??= source.FirstLine?.Value;
+            merged.Hanging ??= source.Hanging?.Value;
+        }
+
         if (styleId == null)
         {
             var defaultStyle = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.Type?.Value == StyleValues.Paragraph && s.Default?.Value == true);
-            return defaultStyle?.StyleParagraphProperties?.Indentation;
+            MergeIndentation(defaultStyle?.StyleParagraphProperties?.Indentation);
         }
         var visited = new HashSet<string>();
         var currentStyleId = styleId;
@@ -488,11 +755,19 @@ public partial class WordHandler
             var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
             if (style == null) break;
-            var ind = style.StyleParagraphProperties?.Indentation;
-            if (ind != null) return ind;
+            MergeIndentation(style.StyleParagraphProperties?.Indentation);
             currentStyleId = style.BasedOn?.Val?.Value;
         }
-        return null;
+
+        MergeIndentation(_doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+            ?.DocDefaults?.ParagraphPropertiesDefault?.ParagraphPropertiesBaseStyle?.Indentation);
+
+        return merged.Left != null
+            || merged.Right != null
+            || merged.FirstLine != null
+            || merged.Hanging != null
+            ? merged
+            : null;
     }
 
     /// <summary>
@@ -511,70 +786,52 @@ public partial class WordHandler
         }
 
         var parts = new List<string>();
-        var visited = new HashSet<string>();
-        var currentStyleId = styleId;
-        while (currentStyleId != null && visited.Add(currentStyleId))
+        var docDefaults = ReadDocDefaults();
+
+        var jc = ResolveJustificationFromStyle(styleId);
+        if (!string.IsNullOrWhiteSpace(jc))
         {
-            var style = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
-                ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == currentStyleId);
-            if (style == null) break;
-
-            var pPr = style.StyleParagraphProperties;
-            if (pPr != null)
-            {
-                var jc = pPr.Justification?.Val;
-                if (jc != null && !parts.Any(p => p.StartsWith("text-align")))
-                {
-                    var align = jc.InnerText switch { "center" => "center", "right" or "end" => "right", "both" => "justify", _ => (string?)null };
-                    if (align != null) parts.Add($"text-align:{align}");
-                }
-
-                var spacing = pPr.SpacingBetweenLines;
-                if (spacing != null)
-                {
-                    if (!parts.Any(p => p.StartsWith("margin-top")))
-                    {
-                        if (spacing.Before?.Value is string b && b != "0")
-                            parts.Add($"margin-top:{Units.TwipsToPt(b):0.##}pt");
-                        else if (spacing.BeforeLines?.Value is int bl && bl != 0)
-                            parts.Add($"margin-top:{bl / 100.0:0.##}em");
-                    }
-                    if (!parts.Any(p => p.StartsWith("margin-bottom")))
-                    {
-                        if (spacing.After?.Value is string a)
-                            parts.Add($"margin-bottom:{Units.TwipsToPt(a):0.##}pt");
-                        else if (spacing.AfterLines?.Value is int al)
-                            parts.Add($"margin-bottom:{al / 100.0:0.##}em");
-                    }
-                    if (spacing.Line?.Value is string lv && !parts.Any(p => p.StartsWith("line-height")))
-                    {
-                        var rule = spacing.LineRule?.InnerText;
-                        if ((rule == "auto" || rule == null) && int.TryParse(lv, out var val))
-                            parts.Add($"line-height:{val / 240.0:0.##}");
-                    }
-                }
-
-                // Indentation
-                var ind = pPr.Indentation;
-                if (ind != null)
-                {
-                    if (ind.Left?.Value is string leftTwips && leftTwips != "0" && !parts.Any(p => p.StartsWith("margin-left")))
-                        parts.Add($"margin-left:{Units.TwipsToPt(leftTwips):0.##}pt");
-                    if (ind.Right?.Value is string rightTwips && rightTwips != "0" && !parts.Any(p => p.StartsWith("margin-right")))
-                        parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
-                    if (ind.FirstLine?.Value is string fl && fl != "0" && !parts.Any(p => p.StartsWith("text-indent")))
-                        parts.Add($"text-indent:{Units.TwipsToPt(fl):0.##}pt");
-                    if (ind.Hanging?.Value is string hg && hg != "0" && !parts.Any(p => p.StartsWith("text-indent")))
-                        parts.Add($"text-indent:-{Units.TwipsToPt(hg):0.##}pt");
-                }
-
-                var shadingFill = ResolveShadingFill(pPr.Shading);
-                if (shadingFill != null && !parts.Any(p => p.StartsWith("background")))
-                    parts.Add($"background-color:{shadingFill}");
-            }
-
-            currentStyleId = style.BasedOn?.Val?.Value;
+            var align = MapJustificationToCss(jc);
+            if (align != null) parts.Add($"text-align:{align}");
         }
+
+        var spacing = ResolveSpacingFromStyle(styleId);
+        if (spacing != null)
+        {
+            if (spacing.Before?.Value is string beforeTwips && beforeTwips != "0")
+                parts.Add($"margin-top:{Units.TwipsToPt(beforeTwips):0.##}pt");
+            else if (spacing.BeforeLines?.Value is int beforeLines && beforeLines != 0)
+                parts.Add($"margin-top:{beforeLines / 100.0:0.##}em");
+
+            if (spacing.After?.Value is string afterTwips && afterTwips != "0")
+                parts.Add($"margin-bottom:{Units.TwipsToPt(afterTwips):0.##}pt");
+            else if (spacing.AfterLines?.Value is int afterLines && afterLines != 0)
+                parts.Add($"margin-bottom:{afterLines / 100.0:0.##}em");
+        }
+
+        // MOD(#7): see cove-desktop-mods.md
+        // Style-only paragraphs should use the same font-metric-aware
+        // line-height path as paragraphs with direct pPr, otherwise WPS and
+        // Word renderings drift on documents that inherit spacing from styles.
+        parts.Add(BuildDefaultParagraphLineHeightCss(para, spacing, docDefaults));
+
+        var ind = ResolveIndentationFromStyle(styleId);
+        if (ind != null)
+        {
+            if (ind.Left?.Value is string leftTwips && leftTwips != "0")
+                parts.Add($"margin-left:{Units.TwipsToPt(leftTwips):0.##}pt");
+            if (ind.Right?.Value is string rightTwips && rightTwips != "0")
+                parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
+            if (ind.FirstLine?.Value is string fl && fl != "0")
+                parts.Add($"text-indent:{Units.TwipsToPt(fl):0.##}pt");
+            if (ind.Hanging?.Value is string hg && hg != "0")
+                parts.Add($"text-indent:-{Units.TwipsToPt(hg):0.##}pt");
+        }
+
+        var shadingFill = ResolveParagraphShadingFromStyle(para);
+        if (shadingFill != null)
+            parts.Add($"background-color:{shadingFill}");
+
         return string.Join(";", parts);
     }
 
@@ -586,12 +843,19 @@ public partial class WordHandler
         // Font
         var fonts = rProps.RunFonts;
         var font = fonts?.EastAsia?.Value ?? fonts?.Ascii?.Value ?? fonts?.HighAnsi?.Value;
-        if (font != null)
+        // Skip theme font references (e.g. "+mn-lt", "+mj-ea") — those are shorthand
+        // markers, not real font names; the theme-resolved value would already be in
+        // AsciiTheme etc. which we don't read here.
+        if (font != null && !font.StartsWith("+", StringComparison.Ordinal))
         {
             var fallback = GetChineseFontFallback(font);
+            // Always append a generic family so the run still renders with the right
+            // serif/sans-serif class when neither the primary nor the CJK fallback
+            // is installed (matters in headless browsers like Playwright).
+            var generic = IsLikelySerif(font) ? "serif" : "sans-serif";
             parts.Add(fallback != null
-                ? $"font-family:'{CssSanitize(font)}',{fallback}"
-                : $"font-family:'{CssSanitize(font)}'");
+                ? $"font-family:'{CssSanitize(font)}',{fallback},{generic}"
+                : $"font-family:'{CssSanitize(font)}',{generic}");
         }
 
         // Size (stored as half-points)
@@ -607,18 +871,43 @@ public partial class WordHandler
         if (rProps.Italic != null && (rProps.Italic.Val == null || rProps.Italic.Val.Value))
             parts.Add("font-style:italic");
 
-        // Underline
+        // Underline: map OOXML variants to CSS text-decoration-style / thickness.
+        // OOXML vals: single, double, thick, dotted, dottedHeavy, dash, dashedHeavy,
+        //   dashLong, dashLongHeavy, dotDash, dotDashHeavy, dotDotDash, dotDotDashHeavy,
+        //   wave, wavyHeavy, wavyDouble, words, none
         if (rProps.Underline?.Val != null)
         {
             var ulVal = rProps.Underline.Val.InnerText;
             if (ulVal != "none")
+            {
                 parts.Add("text-decoration:underline");
+                // Map to text-decoration-style
+                string? style = ulVal switch
+                {
+                    "double" or "wavyDouble" => "double",
+                    "dotted" or "dottedHeavy" => "dotted",
+                    "dash" or "dashedHeavy" or "dashLong" or "dashLongHeavy"
+                        or "dotDash" or "dotDashHeavy" or "dotDotDash" or "dotDotDashHeavy" => "dashed",
+                    "wave" or "wavyHeavy" => "wavy",
+                    _ => null,
+                };
+                if (style != null)
+                    parts.Add($"text-decoration-style:{style}");
+                // Thickness: "thick" and any *Heavy variant
+                if (ulVal != null && (ulVal == "thick" || ulVal.EndsWith("Heavy", StringComparison.Ordinal)))
+                    parts.Add("text-decoration-thickness:2px");
+                // Per-underline color via w:u w:color="RRGGBB"
+                var ulColor = rProps.Underline.Color?.Value;
+                if (!string.IsNullOrEmpty(ulColor) && !ulColor.Equals("auto", StringComparison.OrdinalIgnoreCase)
+                    && IsHexColor(ulColor))
+                    parts.Add($"text-decoration-color:#{ulColor}");
+            }
         }
 
         // Strikethrough (single or double)
-        var hasStrike = (rProps.Strike != null && (rProps.Strike.Val == null || rProps.Strike.Val.Value))
-            || (rProps.DoubleStrike != null && (rProps.DoubleStrike.Val == null || rProps.DoubleStrike.Val.Value));
-        if (hasStrike)
+        var hasSingleStrike = rProps.Strike != null && (rProps.Strike.Val == null || rProps.Strike.Val.Value);
+        var hasDoubleStrike = rProps.DoubleStrike != null && (rProps.DoubleStrike.Val == null || rProps.DoubleStrike.Val.Value);
+        if (hasSingleStrike || hasDoubleStrike)
         {
             var existing = parts.FirstOrDefault(p => p.StartsWith("text-decoration:"));
             if (existing != null)
@@ -630,24 +919,36 @@ public partial class WordHandler
             {
                 parts.Add("text-decoration:line-through");
             }
+            // Double-strike renders via text-decoration-style: double (CSS3, broad support)
+            if (hasDoubleStrike)
+                parts.Add("text-decoration-style:double");
         }
 
-        // Color: w:color val is the pre-computed color (already has themeColor+themeTint applied).
-        // Use val directly; only fall back to theme resolution if val is missing.
-        var colorVal = rProps.Color?.Val?.Value;
-        if (colorVal != null && colorVal != "auto")
+        // Character spacing (w:spacing val in twips = 1/20 pt, can be negative)
+        if (rProps.Spacing?.Val?.HasValue == true)
         {
-            parts.Add($"color:#{colorVal}");
+            var sp = rProps.Spacing.Val.Value;
+            if (sp != 0)
+                parts.Add($"letter-spacing:{sp / 20.0:0.##}pt");
         }
-        else if (rProps.Color?.ThemeColor?.InnerText is string tcName)
+
+        // Character scale (w:w, horizontal stretch as a percentage). Use inline-block +
+        // transform scaleX so rendering width actually changes — transform alone collapses
+        // space reservation. Default/unit value 100% → skip.
+        var charScale = rProps.CharacterScale?.Val?.Value;
+        if (charScale.HasValue && charScale.Value > 0 && charScale.Value != 100)
         {
-            var tc = GetThemeColors();
-            if (tc.TryGetValue(tcName, out var tcHex))
-            {
-                var tint = rProps.Color?.GetAttributes().FirstOrDefault(a => a.LocalName == "themeTint").Value;
-                var shade = rProps.Color?.GetAttributes().FirstOrDefault(a => a.LocalName == "themeShade").Value;
-                parts.Add($"color:{ApplyTintShade(tcHex, tint, shade)}");
-            }
+            var ratio = charScale.Value / 100.0;
+            parts.Add($"display:inline-block;transform:scaleX({ratio:0.##});transform-origin:left");
+        }
+
+        // Color: w:color val + themeColor with tint/shade. Route through
+        // ResolveRunColor for consistency with conditional-format and border
+        // paths. Val wins if not "auto"; else fall through to themeColor.
+        var resolvedColor = ResolveRunColor(rProps.Color);
+        if (resolvedColor != null)
+        {
+            parts.Add($"color:{resolvedColor}");
         }
 
         // Highlight
@@ -658,15 +959,18 @@ public partial class WordHandler
             if (hlColor != null) parts.Add($"background-color:{hlColor}");
         }
 
-        // Superscript / Subscript
+        // Superscript / Subscript — always shrink to match Word's behavior.
+        // Word auto-sizes sub/sup relative to the surrounding run, even when
+        // the run has an explicit size. Use font-size:smaller (browser spec
+        // default for <sub>/<sup>) so the shrinkage compounds with any
+        // explicit size we already emitted for this run.
         var vertAlign = rProps.VerticalTextAlignment?.Val;
         if (vertAlign != null)
         {
-            var hasExplicitSize = rProps.FontSize?.Val?.Value != null;
             if (vertAlign.InnerText == "superscript")
-                parts.Add(hasExplicitSize ? "vertical-align:super" : "vertical-align:super;font-size:smaller");
+                parts.Add("vertical-align:super;font-size:smaller");
             else if (vertAlign.InnerText == "subscript")
-                parts.Add(hasExplicitSize ? "vertical-align:sub" : "vertical-align:sub;font-size:smaller");
+                parts.Add("vertical-align:sub;font-size:smaller");
         }
 
         // SmallCaps / AllCaps
@@ -680,7 +984,7 @@ public partial class WordHandler
         if (runShd != null && highlight == null) // don't override highlight
         {
             var fill = runShd.Fill?.Value;
-            if (fill != null && fill != "auto")
+            if (fill != null && fill != "auto" && IsHexColor(fill))
                 parts.Add($"background-color:#{fill}");
         }
 
@@ -694,14 +998,33 @@ public partial class WordHandler
                 var bdrSz = runBdr.Size?.Value ?? 4;
                 var bdrColor = runBdr.Color?.Value;
                 var px = Math.Max(1, bdrSz / 8.0);
-                var color = (bdrColor != null && bdrColor != "auto") ? $"#{bdrColor}" : "#000";
+                var color = (bdrColor != null && bdrColor != "auto" && IsHexColor(bdrColor)) ? $"#{bdrColor}" : "#000";
                 parts.Add($"border:{px:0.#}px solid {color};padding:0 2px");
             }
         }
 
-        // RTL text direction
+        // RTL text direction — use unicode-bidi:embed so Arabic/Hebrew
+        // contextual shaping + Unicode BiDi algorithm still apply.
+        // bidi-override would force reversal, corrupting Arabic glyph order.
         if (rProps.RightToLeftText != null && (rProps.RightToLeftText.Val == null || rProps.RightToLeftText.Val.Value))
-            parts.Add("direction:rtl;unicode-bidi:bidi-override");
+            parts.Add("direction:rtl;unicode-bidi:embed");
+
+        // East Asian emphasis mark (w:em val=dot/comma/circle/underDot)
+        // → CSS text-emphasis-style, widely supported (including -webkit- prefix)
+        var emVal = rProps.Emphasis?.Val?.InnerText;
+        if (emVal != null && emVal != "none")
+        {
+            string css = emVal switch
+            {
+                "dot" => "filled dot",
+                "comma" => "filled sesame",
+                "circle" => "filled circle",
+                "underDot" => "filled dot",
+                _ => "filled",
+            };
+            var pos = emVal == "underDot" ? "under" : "over";
+            parts.Add($"text-emphasis:{css};text-emphasis-position:{pos};-webkit-text-emphasis:{css};-webkit-text-emphasis-position:{pos}");
+        }
 
         // w14 text effects (textFill, textOutline, glow, shadow, reflection)
         AppendW14CssEffects(rProps, parts);
@@ -747,7 +1070,8 @@ public partial class WordHandler
 
                             if (isRadial)
                             {
-                                parts.Add($"background:radial-gradient(circle,{colors[0]},{colors[1]})");
+                                // CONSISTENCY(radial-gradient-extent): closest-side so gradient reaches shape edge (matches PPTX R2 fix).
+                                parts.Add($"background:radial-gradient(circle closest-side,{colors[0]},{colors[1]})");
                             }
                             else
                             {
@@ -1038,8 +1362,37 @@ public partial class WordHandler
                 parts.Add($"width:{w / 50.0:0.#}%");
         }
 
-        // Padding — add vertical compensation for CSS vs Word rendering difference
-        // (CSS line-height:1 clips glyph ascenders; Word's layout engine doesn't)
+        // Cell text direction (tcDir): rotate text 90° or 270° via CSS writing-mode + transform
+        // Common values: btLr (bottom→top, left→right = 90° CCW), tbRl (top→bottom, right→left = 90° CW)
+        var tcDir = tcPr.GetFirstChild<TextDirection>()?.Val?.InnerText;
+        if (tcDir != null)
+        {
+            var wm = tcDir switch
+            {
+                "btLr" => "vertical-rl;transform:rotate(180deg)", // read bottom-up
+                "tbRl" => "vertical-rl",                            // read top-down
+                "lrTb" or null => null,                             // default horizontal
+                _ => null,
+            };
+            if (wm != null) parts.Add($"writing-mode:{wm}");
+        }
+
+        // Cell noWrap — prevents content wrapping within the cell
+        if (tcPr.NoWrap != null)
+            parts.Add("white-space:nowrap");
+
+        // #7a0: vertical-writing cell + noWrap interaction. When both are
+        // present, flex alignment + min-height otherwise position text in
+        // the cell's middle; Word anchors it at the inline-start edge and
+        // fills the declared trHeight. Force flex-start + stretch so the
+        // text column runs from top (or right, in vertical-rl) of the cell.
+        if (tcDir != null && tcPr.NoWrap != null)
+        {
+            parts.Add("justify-content:flex-start");
+            parts.Add("align-items:stretch");
+        }
+
+        // Padding — add vertical compensation for CSS line-height:1 clipping glyph ascenders
         const double CellPadVComp = 3.0; // pt
         var margins = tcPr?.TableCellMargin;
         {
@@ -1069,19 +1422,26 @@ public partial class WordHandler
         var style = val switch
         {
             "single" => "solid",
+            "thick" => "solid",
             "double" => "double",
+            "triple" => "double",  // CSS has no 3-line; double is closest
             "dashed" or "dashSmallGap" => "dashed",
+            "dashDotStroked" or "dashDotHeavy" => "dashed",
             "dotted" => "dotted",
+            "dotDash" or "dotDotDash" => "dashed",
+            "wave" or "doubleWave" => "solid",  // CSS has no wave border
             _ => "solid"
         };
-        var widthPx = sz != null && int.TryParse(sz, out var s) ? Math.Max(1, s / 8.0) : 1.0;
-        // CSS double border needs at least 3px to render two visible lines
-        if (style == "double" && widthPx < 3) widthPx = 3;
-        var width = $"{widthPx:0.#}px";
+        // OOXML border sz is in 1/8 of a point (8 = 1pt, 24 = 3pt, etc.)
+        var widthPt = sz != null && int.TryParse(sz, out var s) ? Math.Max(0.5, s / 8.0) : 1.0;
+        // CSS double border style needs at least ~2.25pt (≈3px) to show two visible lines
+        if (style == "double" && widthPt < 2.25) widthPt = 2.25;
+        var width = $"{widthPt:0.##}pt";
 
         // Resolve color: try direct color, then themeColor with tint/shade
         string cssColor;
-        if (color != null && !color.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        if (color != null && !color.Equals("auto", StringComparison.OrdinalIgnoreCase)
+            && IsHexColor(color))
         {
             cssColor = $"#{color}";
         }
@@ -1116,7 +1476,7 @@ public partial class WordHandler
     {
         if (color == null) return null;
         var colorVal = color.Val?.Value;
-        if (colorVal != null && colorVal != "auto")
+        if (colorVal != null && colorVal != "auto" && IsHexColor(colorVal))
             return $"#{colorVal}";
         var tcName = color.ThemeColor?.InnerText;
         if (tcName != null && GetThemeColors().TryGetValue(tcName, out var tcHex))
@@ -1152,6 +1512,28 @@ public partial class WordHandler
     };
 
     /// <summary>
+    /// Heuristic: does this typeface name belong to the serif family?
+    /// Used to pick the generic CSS fallback (serif vs sans-serif) when neither
+    /// the primary font nor the CJK fallback is installed.
+    /// </summary>
+    private static bool IsLikelySerif(string font)
+    {
+        var f = font.ToLowerInvariant();
+        // Western serif faces
+        if (f.Contains("times") || f.Contains("serif") || f.Contains("georgia")
+            || f.Contains("cambria") || f.Contains("garamond") || f.Contains("palatino")
+            || f.Contains("book antiqua") || f.Contains("constantia") || f.Contains("didot")
+            || f.Contains("baskerville") || f.Contains("minion"))
+            return true;
+        // CJK serif (宋体 / Song / Ming / Mincho)
+        if (f.Contains("song") || f.Contains("ming") || f.Contains("mincho")
+            || f.Contains("fangsong") || font.Contains("宋") || font.Contains("仿宋")
+            || font.Contains("明朝"))
+            return true;
+        return false;
+    }
+
+    /// <summary>
     /// Returns CSS fallback fonts for common Windows Chinese fonts that are unavailable on Mac.
     /// </summary>
     private string? GetChineseFontFallback(string font)
@@ -1174,18 +1556,26 @@ public partial class WordHandler
     /// <summary>Resolve the dominant font for line-height calculation from a paragraph's runs.</summary>
     private string ResolveParaFontForLineHeight(Paragraph para)
     {
-        // Use the first run's ascii font; fall back to document default
-        var firstRun = para.Elements<Run>().FirstOrDefault();
+        // MOD(#6): see cove-desktop-mods.md
+        // Prefer EastAsia fonts for DOCX preview metrics. Chinese/Japanese/Korean
+        // paragraphs often carry the real line box in rFonts.eastAsia while
+        // ascii/highAnsi stays on a Western fallback like Arial.
+        var firstRun = para.Elements<Run>().FirstOrDefault(r =>
+            r.ChildElements.Any(c => c is Text t && !string.IsNullOrEmpty(t.Text)));
         if (firstRun != null)
         {
             var rProps = ResolveEffectiveRunProperties(firstRun, para);
-            var font = rProps.RunFonts?.Ascii?.Value ?? rProps.RunFonts?.HighAnsi?.Value;
+            var font = rProps.RunFonts?.EastAsia?.Value
+                ?? rProps.RunFonts?.Ascii?.Value
+                ?? rProps.RunFonts?.HighAnsi?.Value;
             if (!string.IsNullOrEmpty(font)) return font;
         }
         // Fall back to document default font
         var defFont = _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
-            ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.Ascii?.Value;
-        return defFont ?? "Calibri";
+            ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.EastAsia?.Value
+            ?? _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles
+                ?.DocDefaults?.RunPropertiesDefault?.RunPropertiesBaseStyle?.RunFonts?.Ascii?.Value;
+        return defFont ?? ReadDocDefaults().Font;
     }
 
     private string? ResolveStyleFontSize(string styleId)
@@ -1215,7 +1605,7 @@ public partial class WordHandler
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == current);
             if (style == null) break;
             var cv = style.StyleRunProperties?.Color?.Val?.Value;
-            if (cv != null && cv != "auto") return $"#{cv}";
+            if (cv != null && cv != "auto" && IsHexColor(cv)) return $"#{cv}";
             var tc = style.StyleRunProperties?.Color?.ThemeColor?.InnerText;
             if (tc != null && GetThemeColors().TryGetValue(tc, out var tcHex)) return $"#{tcHex}";
             current = style.BasedOn?.Val?.Value;
@@ -1242,8 +1632,22 @@ public partial class WordHandler
         return null;
     }
 
-    private static string CssSanitize(string value) =>
-        Regex.Replace(value, @"[""'\\<>&;{}]", "");
+    // Strip every character that isn't a valid CSS identifier-ish character
+    // for font names. OOXML rFonts/theme attrs are attacker-controlled, so
+    // CssSanitize not only removes the obvious breakouts (" ' ; { } < > & \)
+    // but also parens, colons, slashes, and anything non-alpha so a name like
+    // `Arial";background:url(javascript:)//` can't appear as substring inside
+    // the inline style (a CSS parser would treat it as a font name there, but
+    // downstream safety checks still grep for the substring).
+    private static string CssSanitize(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        var sb = new StringBuilder(value.Length);
+        foreach (var c in value)
+            if (char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_' || c == '.')
+                sb.Append(c);
+        return sb.ToString();
+    }
 
     private static string JsStringLiteral(string? text)
     {
@@ -1310,6 +1714,22 @@ public partial class WordHandler
         var mR = $"{pg.MarginRightPt:0.#}pt";
         var mT = $"{pg.MarginTopPt:0.#}pt";
         var mB = $"{pg.MarginBottomPt:0.#}pt";
+        // MOD(#11): see cove-desktop-mods.md
+        // OOXML page header/footer distances are measured from the physical
+        // page edge. `.page` already models the full sheet with page padding
+        // for the body margins, so subtracting body margins here pushes the
+        // header/footer outside the white page box and makes them disappear in
+        // embedded preview iframes.
+        var headerTop = $"{pg.HeaderDistancePt:0.#}pt";
+        var footerBottom = $"{pg.FooterDistancePt:0.#}pt";
+
+        // Honor document-level auto-hyphenation setting. CSS `hyphens: auto`
+        // requires the element (or ancestor) to specify a `lang` attribute;
+        // browsers use the language-specific hyphenation dictionaries.
+        var settings = _doc.MainDocumentPart?.DocumentSettingsPart?.Settings;
+        var hyphensCss = settings?.Descendants<AutoHyphenation>().Any() == true
+            ? "hyphens: auto; -webkit-hyphens: auto;"
+            : "";
         // Build font fallback chain: document font → platform-specific CJK equivalents → generic
         var docFont = CssSanitize(dd.Font);
         var cjkFallback = GetCjkFontFallback(docFont, _eastAsiaLang, _themeCjkFont);
@@ -1319,6 +1739,9 @@ public partial class WordHandler
         var sz = $"{dd.SizePt:0.##}pt";
         // Use docGrid linePitch as line-height when available (CJK snap-to-grid)
         var lh = dd.GridLinePitchPt > 0 ? $"{dd.GridLinePitchPt:0.##}pt" : $"{dd.LineHeight:0.##}";
+        var pLineHeightPt = Math.Max(
+            dd.SizePt * dd.LineHeight * FontMetricsReader.GetRatio(dd.Font),
+            dd.GridLinePitchPt > 0 ? dd.GridLinePitchPt : 0);
 
         return $@"
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -1330,22 +1753,39 @@ public partial class WordHandler
             display: flex; flex-direction: column; font-kerning: none; letter-spacing: 0;
             transform-origin: left top; transition: transform 0.15s ease;
             }}
-        .page-body {{ flex: 1; display: flex; flex-direction: column; text-autospace: ideograph-alpha ideograph-numeric; }}
+        .page-body {{ flex: 1; display: flex; flex-direction: column; text-autospace: ideograph-alpha ideograph-numeric; overflow-wrap: anywhere; {hyphensCss} }}
+        /* Multi-column sections: flex ignores column-count; switch to block. */
+        .page-body[style*=""column-count""] {{ display: block; }}
         .page-body > :first-child {{ margin-top: 0 !important; }}
         .page-body > img + h1, .page-body > img + img + h1 {{ margin-top: 0 !important; }}
+        /* Tracked changes preview: w:del → gray strikethrough, w:ins → red.
+           Use !important + descendant selector to override inline color on
+           inner <span> elements (which inherit the original run's color). */
+        del, del * {{ color: #9ca3af !important; text-decoration: line-through !important; text-decoration-color: #9ca3af !important; }}
+        ins, ins * {{ color: #dc2626 !important; text-decoration: none !important; }}
+        /* MOD(#5): Comment annotation base styles — mark highlighted ranges, aside panel hidden by default (frontend injects interactive UI) */
+        mark[data-id] {{ background: #fef9c3; padding: 0 1px; }}
+        aside[data-type=""comments""] {{ display: none; }}
         .doc-header, .doc-footer {{ font-size: {dd.SizePt:0.##}pt; }}
-        .doc-header {{ position: absolute; top: {pg.HeaderDistancePt:0.#}pt; left: {mL}; right: {mR};
+        .doc-header {{ position: absolute; top: {headerTop}; left: 0; right: 0;
+            padding-left: {mL}; padding-right: {mR};
             padding-bottom: 0.3em; }}
-        .doc-footer {{ position: absolute; bottom: {pg.FooterDistancePt:0.#}pt; left: {mL}; right: {mR};
+        .doc-footer {{ position: absolute; bottom: {footerBottom}; left: 0; right: 0;
+            padding-left: {mL}; padding-right: {mR};
             padding-top: 0.3em; }}
         h1, h2, h3, h4, h5, h6 {{ line-height: normal; }}
-        p {{ margin: 0; margin-bottom: {(dd.SpaceAfterPt > 0 ? $"{dd.SpaceAfterPt:0.##}pt" : "0")}; line-height: {dd.LineHeight * FontMetricsReader.GetRatio(dd.Font):0.##}; text-align: {dd.DefaultAlign};{(dd.DefaultAlign == "justify" ? " text-justify: inter-character;" : "")} text-autospace: ideograph-alpha ideograph-numeric; }}
+        p {{ margin: 0; margin-bottom: {(dd.SpaceAfterPt > 0 ? $"{dd.SpaceAfterPt:0.##}pt" : "0")}; line-height: {pLineHeightPt:0.##}pt; text-align: {dd.DefaultAlign};{(dd.DefaultAlign == "justify" ? " text-justify: inter-character;" : "")} text-autospace: ideograph-alpha ideograph-numeric; }}
+        h1, h2, h3, h4, h5, h6 {{ line-height: normal; }}
+        p {{ margin: 0; margin-bottom: {(dd.SpaceAfterPt > 0 ? $"{dd.SpaceAfterPt:0.##}pt" : "0")}; line-height: {pLineHeightPt:0.##}pt; text-align: {dd.DefaultAlign};{(dd.DefaultAlign == "justify" ? " text-justify: inter-character;" : "")} text-autospace: ideograph-alpha ideograph-numeric; }}
         p.empty {{ margin: 0; min-height: 1em; }}
         a {{ color: #2B579A; }} a:hover {{ color: #1a3c6e; }}
         .toc {{ display: flex; text-indent: 0 !important; }}
         .toc a {{ color: inherit; text-decoration: none; display: flex; flex: 1; }}
         .toc a span {{ color: inherit !important; text-decoration: none !important; }}
         .dot-leader {{ flex: 1; border-bottom: 1px dotted #000; margin: 0 4px; min-width: 2em; align-self: flex-end; margin-bottom: 0.25em; }}
+        .hyphen-leader {{ flex: 1; border-bottom: 1px dashed #000; margin: 0 4px; min-width: 2em; align-self: flex-end; margin-bottom: 0.25em; }}
+        .underscore-leader {{ flex: 1; border-bottom: 1px solid #000; margin: 0 4px; min-width: 2em; align-self: flex-end; margin-bottom: 0.25em; }}
+        .middledot-leader {{ flex: 1; border-bottom: 2px dotted #555; margin: 0 4px; min-width: 2em; align-self: flex-end; margin-bottom: 0.25em; }}
         ul, ol {{ padding-left: 2em; margin: 0.2em 0; }}
         ul {{ list-style-type: disc; }}
         li {{ margin: 0.1em 0; }}
@@ -1358,7 +1798,8 @@ public partial class WordHandler
         .wg p {{ padding: 0; margin: 0.05em 0; }}
         table.borderless {{ border: none; }}
         table.borderless td, table.borderless th {{ border: none; padding: 2px 6px; }}
-        th, td {{ border: none; padding: 3pt 5.4pt; text-align: inherit; vertical-align: top; }}
+        th, td {{ border: none; padding: 3pt 5.4pt; text-align: inherit; vertical-align: top; break-inside: auto; }}
+        tr {{ break-inside: auto; }}
         th {{ font-weight: 600; }}
         @media print {{ body {{ background: white; padding: 0; }}
             .page {{ box-shadow: none; margin: 0; max-width: none; transform: none !important; }}
@@ -1398,7 +1839,10 @@ public partial class WordHandler
         if (isWestern)
         {
             // Prefer theme-resolved CJK font (from supplemental font list)
-            var prefix = !string.IsNullOrEmpty(themeCjkFont) ? $", '{themeCjkFont}'" : "";
+            // CssSanitize the theme font name — theme1.xml is attacker-
+            // controlled and this value interpolates into font-family.
+            var safeTheme = !string.IsNullOrEmpty(themeCjkFont) ? CssSanitize(themeCjkFont) : "";
+            var prefix = !string.IsNullOrEmpty(safeTheme) ? $", '{safeTheme}'" : "";
             var lang = eastAsiaLang?.ToLowerInvariant() ?? "";
             if (lang.StartsWith("ja"))
                 return prefix + ", 'Hiragino Mincho ProN', 'Yu Mincho', 'MS Mincho'";

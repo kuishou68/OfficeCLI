@@ -154,6 +154,13 @@ public partial class ExcelHandler
             var dirAttr = isRtl ? " dir=\"rtl\"" : "";
             sb.AppendLine($"<div class=\"sheet-content{activeClass}\" data-sheet=\"{sheetIdx}\"{dirAttr}>");
             var charts = CollectSheetCharts(worksheetPart, sheetName);
+            // Shapes and textboxes (xdr:sp). Reuses the chart overlay
+            // positioning pipeline — same (fromRow,toRow,fromCol,toCol,html)
+            // tuple is consumed by RenderSheetTable to emit an absolutely-
+            // positioned overlay over the sheet grid.
+            var shapes = CollectSheetShapes(worksheetPart);
+            if (shapes.Count > 0)
+                charts.AddRange(shapes);
             RenderSheetTable(sb, sheetName, renderPart, stylesheet, charts, sheetIdx);
             sb.AppendLine("</div>");
         }
@@ -171,7 +178,11 @@ public partial class ExcelHandler
             {
                 var rgb = tabColorEl.Rgb.Value;
                 if (rgb.Length > 6) rgb = rgb[^6..];
-                tabColorStyle = $" style=\"--tab-color:#{rgb}\"";
+                // Hex-gate before inline style interpolation — unchecked
+                // raw value would break out of the style attribute.
+                if (rgb.Length == 6
+                    && rgb.All(c => (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+                    tabColorStyle = $" style=\"--tab-color:#{rgb}\"";
             }
             sb.AppendLine($"  <div class=\"sheet-tab{activeClass}\"{tabColorStyle} data-sheet=\"{i}\" role=\"tab\" tabindex=\"0\" onclick=\"switchSheet({i})\" onkeydown=\"if(event.key==='Enter'||event.key===' ')switchSheet({i})\">{HtmlEncode(sheets[i].Name)}</div>");
         }
@@ -1227,6 +1238,10 @@ public partial class ExcelHandler
                 styles[existing] = styles[existing] + " underline";
             else
                 styles.Add("text-decoration:underline");
+            // Render double / doubleAccounting as a true double underline.
+            var ulVal = font.Underline.Val?.Value;
+            if (ulVal == UnderlineValues.Double || ulVal == UnderlineValues.DoubleAccounting)
+                styles.Add("text-decoration-style:double");
         }
 
         // Superscript/Subscript via VerticalTextAlignment
@@ -1458,12 +1473,15 @@ public partial class ExcelHandler
 
     private static string FormatColorForCss(string raw)
     {
-        // ARGB "FFFF0000" → "#FF0000", or 6-char hex
-        if (raw.Length == 8)
-            return "#" + raw[2..];
-        if (raw.Length == 6)
-            return "#" + raw;
-        return "#" + raw;
+        // Reject non-hex raw values before interpolating into inline CSS —
+        // styles.xml / indexedColors attrs are attacker-controlled, and an
+        // unvalidated raw flows into `color:#{raw}` / `background:#{raw}`
+        // as an XSS sink.
+        static bool isHex(string s) =>
+            s.All(c => (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+        if (raw.Length == 8 && isHex(raw)) return "#" + raw[2..];
+        if (raw.Length is 6 or 3 && isHex(raw)) return "#" + raw;
+        return "#000";
     }
 
     // ==================== Formatted Cell Value ====================
@@ -1854,7 +1872,7 @@ public partial class ExcelHandler
         if (stylesheet?.Fonts != null && stylesheet.Fonts.Elements<Font>().Any())
         {
             var f0 = stylesheet.Fonts.Elements<Font>().First();
-            if (f0.FontName?.Val?.Value != null) defFontName = f0.FontName.Val.Value;
+            if (f0.FontName?.Val?.Value != null) defFontName = CssSanitize(f0.FontName.Val.Value);
             if (f0.FontSize?.Val?.Value != null) defFontSize = f0.FontSize.Val.Value.ToString("0.##");
         }
         return $$"""
@@ -1960,10 +1978,15 @@ public partial class ExcelHandler
             border-right: none;
         }
         td {
-            /* Default gridlines. Explicit OOXML borders are rendered as inline
-               styles on individual cells, which win the border-collapse contest
-               because inline specificity > stylesheet rule. */
-            border: 1px solid #e0e0e0;
+            /* Default gridlines are painted with inset box-shadow instead of
+               border, so they do NOT participate in border-collapse tie-breaking.
+               Explicit OOXML borders (rendered as inline border styles on cells
+               with an OOXML style) always win at cell boundaries; missing cells
+               / style-0 cells no longer erase neighbours' black borders via the
+               CSS position-based tie-break. Right+bottom gridlines are owned by
+               each cell; first-row top and first-col left gridlines are added
+               via the :first-child rules below. */
+            box-shadow: inset -1px -1px 0 #e0e0e0;
             padding: 2px 4px;
             white-space: nowrap;
             overflow: hidden;
@@ -1972,14 +1995,15 @@ public partial class ExcelHandler
             max-width: 500px;
             word-break: break-all; /* CJK text wrapping support */
         }
+        tbody tr:first-child td { box-shadow: inset -1px -1px 0 #e0e0e0, inset 0 1px 0 #e0e0e0; }
+        tr td:first-of-type { box-shadow: inset -1px -1px 0 #e0e0e0, inset 1px 0 0 #e0e0e0; }
+        tbody tr:first-child td:first-of-type { box-shadow: inset -1px -1px 0 #e0e0e0, inset 1px 1px 0 #e0e0e0; }
         .empty-sheet {
             padding: 40px;
             text-align: center;
             color: #999;
             font-size: 14px;
         }
-        /* Frozen pane visual separator */
-        tr:nth-child(1) td { border-top-color: #e0e0e0; }
         /* Chart containers */
         .chart-container {
             margin: 16px auto;

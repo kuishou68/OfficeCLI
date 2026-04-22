@@ -107,7 +107,13 @@ internal partial class ChartSvgRenderer
             var spPrFill = series.GetFirstChild<CX.ShapeProperties>()
                 ?.GetFirstChild<Drawing.SolidFill>()
                 ?.GetFirstChild<Drawing.RgbColorModelHex>()?.Val?.Value;
-            if (!string.IsNullOrEmpty(spPrFill)) info.Colors.Add($"#{spPrFill}");
+            // Hex-gate the raw attribute — an adversarial chartEx chart1.xml
+            // otherwise feeds the color into legend/SVG style attributes and
+            // escapes the context.
+            if (!string.IsNullOrEmpty(spPrFill)
+                && spPrFill.Length is 3 or 6 or 8
+                && spPrFill.All(c => (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+                info.Colors.Add($"#{spPrFill}");
         }
 
         // Fill in fallback colors for any series without an explicit spPr

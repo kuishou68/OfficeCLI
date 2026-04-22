@@ -3,8 +3,15 @@ name: Build
 on:
   workflow_dispatch:
   push:
+    branches: [main, dev, feat/**]
     tags:
       - 'v*'
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -12,6 +19,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - rid: osx-arm64
@@ -51,6 +59,7 @@ jobs:
         run: git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git" src/officecli/wiki || echo "Wiki clone failed, using fallback help"
 
       - name: Verify wiki version matches csproj version
+        if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'iOfficeAI/OfficeCLI'
         run: |
           CSPROJ_VERSION=$(grep '<Version>' src/officecli/officecli.csproj | sed 's/.*<Version>\(.*\)<\/Version>.*/\1/')
           WIKI_VERSION=$(python3 -c "import json; print(json.load(open('src/officecli/wiki/version.json'))['version'])" 2>/dev/null || echo "unknown")
@@ -88,9 +97,6 @@ jobs:
           (matrix.rid == 'linux-x64' && runner.os == 'Linux') ||
           (matrix.rid == 'win-x64' && runner.os == 'Windows')
         env:
-          # Disable Git Bash (MSYS) POSIX-to-Windows path conversion on
-          # windows-latest, which otherwise mangles `/body` into
-          # `C:/Program Files/Git/body` before it reaches the CLI.
           MSYS_NO_PATHCONV: '1'
           MSYS2_ARG_CONV_EXCL: '*'
         run: |
@@ -125,6 +131,36 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: publish/${{ matrix.name }}
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/v') && 90 || 7 }}
+
+  # Collect all platform artifacts into a single downloadable bundle
+  artifacts-summary:
+    needs: build
+    if: "!startsWith(github.ref, 'refs/tags/v')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          mkdir -p flat
+          find artifacts -type f -exec mv {} flat/ \;
+          rm -rf artifacts
+          mv flat artifacts
+          cd artifacts
+          sha256sum officecli-* > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: officecli-all-platforms
+          path: artifacts/
+          retention-days: 7
 
   release:
     needs: build

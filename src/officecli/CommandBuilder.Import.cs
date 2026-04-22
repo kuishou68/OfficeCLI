@@ -167,7 +167,7 @@ static partial class CommandBuilder
                 ? false
                 : TryStartResidentProcess(fullCreatedPath, idleSeconds: 60, out residentErr);
             var residentSuffix = residentStarted
-                ? " (resident started, auto-close in 60s idle)"
+                ? " (kept open in background for faster subsequent commands)"
                 : "";
 
             if (json)
