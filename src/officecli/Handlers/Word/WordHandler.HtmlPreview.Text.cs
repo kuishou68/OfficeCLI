@@ -190,58 +190,51 @@ public partial class WordHandler
             }
             else if (child is Hyperlink hyperlink)
             {
-                var relId = hyperlink.Id?.Value;
-                string? url = null;
-                if (relId != null)
-                {
-                    try
-                    {
-                        url = _doc.MainDocumentPart?.HyperlinkRelationships
-                            .FirstOrDefault(r => r.Id == relId)?.Uri?.ToString();
-                    }
-                    catch { }
-                    if (url == null)
-                    {
-                        try
-                        {
-                            url = _doc.MainDocumentPart?.ExternalRelationships
-                                .FirstOrDefault(r => r.Id == relId)?.Uri?.ToString();
-                        }
-                        catch { }
-                    }
-                }
-
-                // Also check for internal bookmark links (Anchor property)
-                if (url == null && hyperlink.Anchor?.Value != null)
-                    url = $"#{hyperlink.Anchor.Value}";
-
-                if (url != null)
-                    sb.Append($"<a href=\"{HtmlEncodeAttr(url)}\"{(url.StartsWith("#") ? "" : " target=\"_blank\"")}>");
-
-                foreach (var hRun in hyperlink.Elements<Run>())
-                    RenderRunHtml(sb, hRun, para);
-
-                if (url != null)
-                    sb.Append("</a>");
+                RenderHyperlinkHtml(sb, hyperlink, para);
             }
             else if (child.LocalName == "oMath" || child is M.OfficeMath)
             {
                 var latex = FormulaParser.ToLatex(child);
                 sb.Append($"<span class=\"katex-formula\" data-formula=\"{HtmlEncodeAttr(latex)}\"></span>");
             }
-            else if (child.LocalName is "sdt" or "smartTag" or "customXml")
-            {
-                // Content controls, smart tags, custom XML — render their child runs
-                foreach (var innerRun in child.Descendants<Run>())
-                    RenderRunHtml(sb, innerRun, para);
-            }
             else if (child is SimpleField simpleField)
             {
                 if (TryRenderHeaderFooterSimpleField(sb, simpleField, para))
                     continue;
-                // Simple field codes (page numbers, cross-refs) — render cached display text
-                foreach (var fldRun in simpleField.Elements<Run>())
-                    RenderRunHtml(sb, fldRun, para);
+
+                var emittedRuns = new HashSet<OpenXmlElement>();
+                foreach (var innerHyp in simpleField.Descendants<Hyperlink>())
+                {
+                    RenderHyperlinkHtml(sb, innerHyp, para);
+                    foreach (var r in innerHyp.Descendants<Run>())
+                        emittedRuns.Add(r);
+                }
+                foreach (var innerRun in simpleField.Descendants<Run>())
+                {
+                    if (emittedRuns.Contains(innerRun)) continue;
+                    RenderRunHtml(sb, innerRun, para);
+                }
+            }
+            else if (child.LocalName is "sdt" or "smartTag" or "customXml")
+            {
+                // Content controls, smart tags, custom XML, simple fields —
+                // render hyperlinks with href + their own runs (TOC entries
+                // are authored as <w:fldSimple> wrapping <w:hyperlink>),
+                // then render bare runs. Runs nested inside a hyperlink are
+                // emitted by the hyperlink branch so skip them at the
+                // outer Run pass.
+                var emittedRuns = new HashSet<OpenXmlElement>();
+                foreach (var innerHyp in child.Descendants<Hyperlink>())
+                {
+                    RenderHyperlinkHtml(sb, innerHyp, para);
+                    foreach (var r in innerHyp.Descendants<Run>())
+                        emittedRuns.Add(r);
+                }
+                foreach (var innerRun in child.Descendants<Run>())
+                {
+                    if (emittedRuns.Contains(innerRun)) continue;
+                    RenderRunHtml(sb, innerRun, para);
+                }
             }
         }
 
@@ -342,8 +335,21 @@ public partial class WordHandler
         {
             var fnId = (int)fnRef.Id.Value;
             _ctx.FootnoteRefs.Add(fnId);
-            var fnNum = _ctx.FootnoteRefs.Count;
-            var fnLabel = FormatNoteNumber(fnNum, GetFootnoteNumFmt());
+            // #8a: when the current section has numRestart=eachSect, the
+            // displayed number counts from 1 within that section; otherwise
+            // it's the document-wide running total.
+            int displayNum;
+            if (_ctx.FnRestartEachSection)
+            {
+                _ctx.FnCountInSection++;
+                displayNum = _ctx.FnCountInSection;
+            }
+            else
+            {
+                displayNum = _ctx.FootnoteRefs.Count;
+            }
+            var fnLabel = FormatNoteNumber(displayNum, GetFootnoteNumFmt());
+            _ctx.FnLabels[fnId] = fnLabel;
             sb.Append($"<sup class=\"fn-ref\"><a href=\"#fn{fnId}\" id=\"fnref{fnId}\">{fnLabel}</a></sup>");
         }
         var enRef = run.GetFirstChild<EndnoteReference>();
@@ -708,17 +714,85 @@ public partial class WordHandler
             var fn = fnPart.Footnotes.Elements<Footnote>().FirstOrDefault(f => f.Id?.Value == fnId);
             if (fn == null) continue;
 
-            var fnLabel = FormatNoteNumber(num, fnFmt);
+            // #8a: reuse the label that was stored at ref-emit time so the
+            // bottom list matches the superscript. Falls back to the flat
+            // running number when the ref emitter didn't cache a label
+            // (e.g. footnote referenced from header/footer).
+            var fnLabel = _ctx.FnLabels.TryGetValue(fnId, out var cached)
+                ? cached
+                : FormatNoteNumber(num, fnFmt);
             sb.Append($"<div id=\"fn{fnId}\" style=\"margin:0.3em 0\"><sup>{fnLabel}</sup> ");
-            var fnParas = fn.Elements<Paragraph>().ToList();
-            for (int pi = 0; pi < fnParas.Count; pi++)
-            {
-                RenderParagraphContentHtml(sb, fnParas[pi]);
-                if (pi < fnParas.Count - 1) sb.Append("<br>");
-            }
+            RenderFootnoteChildren(sb, fn);
             sb.AppendLine($" <a href=\"#fnref{fnId}\" style=\"text-decoration:none\">\u21A9</a></div>");
         }
         sb.AppendLine("</div>");
+    }
+
+    // Render paragraphs AND tables inside a footnote/endnote. The previous
+    // implementation only iterated Elements<Paragraph>() so a footnote with
+    // a nested table silently dropped the table (and when a footnote
+    // contained only a table, the whole footnote rendered empty).
+    private IEnumerable<OpenXmlPart> CollectHyperlinkHostParts()
+    {
+        var main = _doc.MainDocumentPart;
+        if (main == null) yield break;
+        yield return main;
+        foreach (var hp in main.HeaderParts) yield return hp;
+        foreach (var fp in main.FooterParts) yield return fp;
+        if (main.FootnotesPart != null) yield return main.FootnotesPart;
+        if (main.EndnotesPart != null) yield return main.EndnotesPart;
+    }
+
+    private void RenderHyperlinkHtml(StringBuilder sb, Hyperlink hyperlink, Paragraph para)
+    {
+        var relId = hyperlink.Id?.Value;
+        string? url = null;
+        if (relId != null)
+        {
+            // Hyperlink rels can live on the enclosing HeaderPart/FooterPart/
+            // FootnotesPart/EndnotesPart, not just MainDocumentPart. Falling
+            // back to a full-part sweep keeps header/footer links clickable.
+            try
+            {
+                var parts = CollectHyperlinkHostParts();
+                foreach (var part in parts)
+                {
+                    url = part.HyperlinkRelationships.FirstOrDefault(r => r.Id == relId)?.Uri?.ToString();
+                    if (url != null) break;
+                    url = part.ExternalRelationships.FirstOrDefault(r => r.Id == relId)?.Uri?.ToString();
+                    if (url != null) break;
+                }
+            }
+            catch { }
+        }
+        if (url == null && hyperlink.Anchor?.Value != null)
+            url = $"#{hyperlink.Anchor.Value}";
+        var urlSafe = url != null && IsSafeLinkUrl(url);
+        if (urlSafe)
+            sb.Append($"<a href=\"{HtmlEncodeAttr(url!)}\"{(url!.StartsWith("#") ? "" : " target=\"_blank\"")}>");
+        foreach (var descendant in hyperlink.Descendants<Run>())
+            RenderRunHtml(sb, descendant, para);
+        if (urlSafe)
+            sb.Append("</a>");
+    }
+
+    private void RenderFootnoteChildren(StringBuilder sb, OpenXmlElement note)
+    {
+        bool first = true;
+        foreach (var child in note.ChildElements)
+        {
+            if (child is Paragraph p)
+            {
+                if (!first) sb.Append("<br>");
+                RenderParagraphContentHtml(sb, p);
+                first = false;
+            }
+            else if (child is Table tbl)
+            {
+                RenderTableHtml(sb, tbl);
+                first = false;
+            }
+        }
     }
 
     private void RenderEndnotesHtml(StringBuilder sb)
@@ -743,12 +817,7 @@ public partial class WordHandler
             var enIndent = ResolveStyleIndent("EndnoteText");
             var enIndentCss = enIndent != null ? $"text-indent:{enIndent}" : "";
             sb.Append($"<div id=\"en{enId}\" style=\"margin:0.3em 0;{enIndentCss}\"><sup>{enLabel}</sup> ");
-            var enParas = en.Elements<Paragraph>().ToList();
-            for (int pi = 0; pi < enParas.Count; pi++)
-            {
-                RenderParagraphContentHtml(sb, enParas[pi]);
-                if (pi < enParas.Count - 1) sb.Append("<br>");
-            }
+            RenderFootnoteChildren(sb, en);
             sb.AppendLine("</div>");
         }
         sb.AppendLine("</div>");

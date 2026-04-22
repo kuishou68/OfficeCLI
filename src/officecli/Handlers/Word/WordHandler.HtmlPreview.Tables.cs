@@ -39,18 +39,47 @@ public partial class WordHandler
         var tableStyles = new List<string>();
         if (tblpPr != null)
         {
-            // Float the table; determine alignment from horzAnchor/tblpX
+            // #2: Float the table with approximate positioning. Horizontal
+            // anchor + tblpX/tblpY translated into float + margin. Coverage
+            // is ~40% of Word's 2D flow (horzAnchor=margin + vertAnchor=text);
+            // vertAnchor=page/margin would need absolute positioning which
+            // doesn't interact with text flow.
             var hAnchor = tblpPr.HorizontalAnchor?.InnerText;
+            var vAnchor = tblpPr.VerticalAnchor?.InnerText;
             var tblpX = tblpPr.TablePositionX?.Value ?? 0;
-            var floatDir = (hAnchor == "page" && tblpX > 5000) ? "right" : "left";
+            var tblpY = tblpPr.TablePositionY?.Value ?? 0;
+            var xAlign = tblpPr.TablePositionXAlignment?.InnerText;
+            var floatDir = xAlign == "right" || (hAnchor == "page" && tblpX > 5000)
+                ? "right"
+                : xAlign == "left" ? "left" : "left";
             tableStyles.Add($"float:{floatDir}");
-            // Margins from text distance
+            // Margins from text distance (dist…FromText).
             var rightDist = tblpPr.RightFromText?.Value ?? 0;
             var bottomDist = tblpPr.BottomFromText?.Value ?? 0;
             var leftDist = tblpPr.LeftFromText?.Value ?? 0;
-            if (rightDist > 0) tableStyles.Add($"margin-right:{rightDist / 20.0:0.#}pt");
+            var topDist = tblpPr.TopFromText?.Value ?? 0;
+            // Fold tblpX into margin-left (or margin-right for float:right)
+            // when the anchor is margin-relative so the column offset shows.
+            var horzShiftPt = hAnchor == "margin" ? tblpX / 20.0 : 0;
+            if (floatDir == "left")
+            {
+                var leftMargin = leftDist / 20.0 + horzShiftPt;
+                if (leftMargin > 0) tableStyles.Add($"margin-left:{leftMargin:0.#}pt");
+                if (rightDist > 0) tableStyles.Add($"margin-right:{rightDist / 20.0:0.#}pt");
+            }
+            else
+            {
+                var rightMargin = rightDist / 20.0 + horzShiftPt;
+                if (rightMargin > 0) tableStyles.Add($"margin-right:{rightMargin:0.#}pt");
+                if (leftDist > 0) tableStyles.Add($"margin-left:{leftDist / 20.0:0.#}pt");
+            }
+            // Vertical offset: only honor vertAnchor=text (default); other
+            // anchors would need absolute positioning, which breaks text
+            // flow and is better left to a future pass.
+            var vertShiftPt = (vAnchor == null || vAnchor == "text") ? tblpY / 20.0 : 0;
+            var topMargin = topDist / 20.0 + vertShiftPt;
+            if (topMargin > 0) tableStyles.Add($"margin-top:{topMargin:0.#}pt");
             if (bottomDist > 0) tableStyles.Add($"margin-bottom:{bottomDist / 20.0:0.#}pt");
-            if (leftDist > 0) tableStyles.Add($"margin-left:{leftDist / 20.0:0.#}pt");
         }
 
         // Table horizontal alignment on page (jc = center/right)
@@ -161,7 +190,10 @@ public partial class WordHandler
             var trStyle = "";
             if (trHeight?.Val?.Value is uint hVal && hVal > 0)
                 trStyle = $" style=\"height:{hVal / 20.0:0.#}pt\"";
-            sb.AppendLine(isHeader ? $"<tr class=\"header-row\"{trStyle}>" : $"<tr{trStyle}>");
+            // #7b00: mark tblHeader rows so the JS paginator can clone them
+            // onto every continuation page when a long table spans pages.
+            var hdrMarker = isHeader ? " data-tbl-header=\"1\"" : "";
+            sb.AppendLine(isHeader ? $"<tr class=\"header-row\"{hdrMarker}{trStyle}>" : $"<tr{trStyle}>");
 
             int colIdx = 0;
             foreach (var cell in row.Elements<TableCell>())
@@ -300,43 +332,35 @@ public partial class WordHandler
         NoVBand = 0x0400,
     }
 
-    /// <summary>Parse tblLook from table properties. Individual attributes
-    /// (firstRow/firstColumn/…) take precedence over the legacy val hex
-    /// bitmask — spec §17.7.6.7 marks val as deprecated.</summary>
+    /// <summary>Parse tblLook from table properties. Start from the legacy
+    /// val hex bitmask (if present) and let each authored individual attr
+    /// override only the bit it names — per ECMA-376 §17.7.6.7, individual
+    /// attrs are independent overrides of val, not a full replacement.</summary>
     private static TableLookFlags ParseTableLook(TableProperties? tblPr)
     {
         var tblLook = tblPr?.GetFirstChild<TableLook>();
         if (tblLook == null) return TableLookFlags.None;
 
-        // If ANY individual boolean attr is set (true OR false), use them
-        // exclusively — a firstColumn="0" authored to turn OFF conditional
-        // formatting must win over a legacy Val bitmask that would set it.
-        var hasIndividualAttrs =
-            tblLook.FirstRow != null ||
-            tblLook.LastRow != null ||
-            tblLook.FirstColumn != null ||
-            tblLook.LastColumn != null ||
-            tblLook.NoHorizontalBand != null ||
-            tblLook.NoVerticalBand != null;
-
-        if (hasIndividualAttrs)
-        {
-            var flags = TableLookFlags.None;
-            if (tblLook.FirstRow?.Value == true) flags |= TableLookFlags.FirstRow;
-            if (tblLook.LastRow?.Value == true) flags |= TableLookFlags.LastRow;
-            if (tblLook.FirstColumn?.Value == true) flags |= TableLookFlags.FirstColumn;
-            if (tblLook.LastColumn?.Value == true) flags |= TableLookFlags.LastColumn;
-            if (tblLook.NoHorizontalBand?.Value == true) flags |= TableLookFlags.NoHBand;
-            if (tblLook.NoVerticalBand?.Value == true) flags |= TableLookFlags.NoVBand;
-            return flags;
-        }
-
-        // Fall back to val hex bitmask when no individual attrs are authored.
+        var flags = TableLookFlags.None;
         var val = tblLook.Val?.Value;
         if (val != null && int.TryParse(val, System.Globalization.NumberStyles.HexNumber, null, out var hex))
-            return (TableLookFlags)hex;
+            flags = (TableLookFlags)hex;
 
-        return TableLookFlags.None;
+        // Each authored attr (regardless of true/false) overrides its bit.
+        if (tblLook.FirstRow != null)
+            flags = tblLook.FirstRow.Value == true ? flags | TableLookFlags.FirstRow : flags & ~TableLookFlags.FirstRow;
+        if (tblLook.LastRow != null)
+            flags = tblLook.LastRow.Value == true ? flags | TableLookFlags.LastRow : flags & ~TableLookFlags.LastRow;
+        if (tblLook.FirstColumn != null)
+            flags = tblLook.FirstColumn.Value == true ? flags | TableLookFlags.FirstColumn : flags & ~TableLookFlags.FirstColumn;
+        if (tblLook.LastColumn != null)
+            flags = tblLook.LastColumn.Value == true ? flags | TableLookFlags.LastColumn : flags & ~TableLookFlags.LastColumn;
+        if (tblLook.NoHorizontalBand != null)
+            flags = tblLook.NoHorizontalBand.Value == true ? flags | TableLookFlags.NoHBand : flags & ~TableLookFlags.NoHBand;
+        if (tblLook.NoVerticalBand != null)
+            flags = tblLook.NoVerticalBand.Value == true ? flags | TableLookFlags.NoVBand : flags & ~TableLookFlags.NoVBand;
+
+        return flags;
     }
 
     /// <summary>Cached conditional format data from a table style.</summary>

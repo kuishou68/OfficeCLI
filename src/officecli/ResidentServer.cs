@@ -879,8 +879,11 @@ public class ResidentServer : IDisposable
                 var browser = req.GetArgOrNull("browser") == "true";
                 if (browser)
                 {
-                    // --browser: write to temp file and open in browser (matches non-resident behavior)
-                    var htmlPath = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}.html");
+                    // SECURITY: include a random token so the preview path is not predictable.
+                    // Without it, a predictable path enables a symlink pre-placement attack that
+                    // causes File.WriteAllText to clobber an arbitrary victim file. See
+                    // CommandBuilder.View.cs for the same fix.
+                    var htmlPath = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
                     File.WriteAllText(htmlPath, html);
                     Console.WriteLine(htmlPath);
                     try
@@ -1011,6 +1014,9 @@ public class ResidentServer : IDisposable
             Console.WriteLine($"No properties applied to {path}");
         if (unsupported.Count > 0)
             Console.Error.WriteLine($"UNSUPPORTED props (use raw-set instead): {string.Join(", ", unsupported)}");
+        var overflow = CommandBuilder.CheckTextOverflow(_handler, path);
+        if (overflow != null)
+            Console.Error.WriteLine($"  WARNING: {overflow}");
     }
 
     private void ExecuteAdd(ResidentRequest req)
@@ -1030,6 +1036,9 @@ public class ResidentServer : IDisposable
             var properties = req.GetProps();
             var resultPath = _handler.Add(parentPath, type, position, properties);
             Console.WriteLine($"Added {type} at {resultPath}");
+            var overflow = CommandBuilder.CheckTextOverflow(_handler, resultPath);
+            if (overflow != null)
+                Console.Error.WriteLine($"  WARNING: {overflow}");
         }
     }
 

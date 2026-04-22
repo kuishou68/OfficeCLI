@@ -134,10 +134,15 @@ public partial class ExcelHandler
             return;
         }
 
+        // R13-1: enforce Excel's 32767-char per-cell limit at the CSV/TSV
+        // import path too, so bulk imports fail fast instead of producing a
+        // file Excel refuses to open.
+        EnsureCellValueLength(value, cell.CellReference?.Value);
+
         // Formula: starts with =
         if (value.StartsWith('='))
         {
-            cell.CellFormula = new CellFormula(value[1..]);
+            cell.CellFormula = new CellFormula(OfficeCli.Core.ModernFunctionQualifier.Qualify(value[1..]));
             cell.CellValue = null;
             cell.DataType = null;
             return;

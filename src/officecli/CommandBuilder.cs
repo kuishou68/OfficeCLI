@@ -125,7 +125,6 @@ static partial class CommandBuilder
         rootCommand.Add(BuildRawSetCommand(jsonOption));
         rootCommand.Add(BuildAddPartCommand(jsonOption));
         rootCommand.Add(BuildValidateCommand(jsonOption));
-        rootCommand.Add(BuildCheckCommand(jsonOption));
         rootCommand.Add(BuildBatchCommand(jsonOption));
         rootCommand.Add(BuildImportCommand(jsonOption));
         rootCommand.Add(BuildCreateCommand(jsonOption));
@@ -171,12 +170,20 @@ static partial class CommandBuilder
         // spawning, then restore.  This prevents the shell's pipe handles
         // from leaking into the resident while still allowing .NET's internal
         // handle plumbing to work.
+        //
+        // On macOS/Linux, posix_spawn inherits fds unless the child's
+        // stdout/stderr are explicitly redirected.  RedirectStandardOutput /
+        // RedirectStandardError = true makes .NET plumb a fresh pipe from
+        // parent to child, so the caller's shell pipe (e.g. `| tail -1`,
+        // $(...)) is NOT inherited and EOFs promptly when the client exits.
+        // See ResidentStdoutInheritanceTests for the regression lock-in.
         var startInfo = new ProcessStartInfo
         {
             FileName = exePath,
             Arguments = $"__resident-serve__ \"{filePath}\"",
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
             RedirectStandardError = true
         };
 
@@ -301,6 +308,14 @@ static partial class CommandBuilder
                 if (!ResidentClient.TryConnect(filePath, out _))
                     return null; // truly no resident → caller falls back to direct file access
             }
+            // Intentionally no user-facing hint here. UX testing with an AI
+            // agent showed a standalone "background process" hint on a random
+            // mid-batch command (e.g. `get`) creates low-grade anxiety without
+            // giving the caller a concrete action — auto-close in 60s already
+            // handles the cleanup, and other officecli commands work normally
+            // through the resident regardless. The `create` command keeps a
+            // small inline suffix on its success line because it's contextual
+            // to a freshly-created file, not a nag fired from anywhere.
         }
 
         var request = new ResidentRequest();
@@ -1071,12 +1086,16 @@ static partial class CommandBuilder
     /// Check if a shape's text overflows its bounds using CJK-aware character measurement.
     /// Returns a warning message or null.
     /// </summary>
-    private static string? CheckTextOverflow(IDocumentHandler handler, string path)
+    internal static string? CheckTextOverflow(IDocumentHandler handler, string path)
     {
-        if (handler is not OfficeCli.Handlers.PowerPointHandler pptHandler) return null;
         try
         {
-            return pptHandler.CheckShapeTextOverflow(path);
+            return handler switch
+            {
+                OfficeCli.Handlers.PowerPointHandler ppt => ppt.CheckShapeTextOverflow(path),
+                OfficeCli.Handlers.ExcelHandler xl => xl.CheckCellOverflow(path),
+                _ => null
+            };
         }
         catch { return null; }
     }

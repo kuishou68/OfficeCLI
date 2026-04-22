@@ -41,7 +41,13 @@ public partial class WordHandler
     {
         if (_themeColors != null) return _themeColors;
 
-        var colorScheme = _doc.MainDocumentPart?.ThemePart?.Theme?.ThemeElements?.ColorScheme;
+        // A malformed theme1.xml (any XML error) throws XmlException on
+        // lazy access deep inside the first reader. Fall back to the Office
+        // default palette rather than tainting the whole preview. Same
+        // approach used for styles/footnotes below.
+        DocumentFormat.OpenXml.Drawing.ColorScheme? colorScheme = null;
+        try { colorScheme = _doc.MainDocumentPart?.ThemePart?.Theme?.ThemeElements?.ColorScheme; }
+        catch (System.Xml.XmlException) { }
         _themeColors = ThemeColorResolver.BuildColorMap(colorScheme, includePptAliases: false);
 
         // Fill in any missing standard names from the Office default theme so
@@ -96,7 +102,7 @@ public partial class WordHandler
             if (rgb != null)
             {
                 var val = rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
-                if (val != null) return $"background-color:#{val}";
+                if (val != null && IsHexColor(val)) return $"background-color:#{val}";
             }
             var scheme = solidFill.Elements().FirstOrDefault(e => e.LocalName == "schemeClr");
             if (scheme != null)
@@ -159,7 +165,10 @@ public partial class WordHandler
 
         string? color = null;
         var rgb = solidFill.Elements().FirstOrDefault(e => e.LocalName == "srgbClr");
-        if (rgb != null) color = $"#{rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value}";
+        if (rgb != null) {
+            var rv = rgb.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
+            if (rv != null && IsHexColor(rv)) color = $"#{rv}";
+        }
         var scheme = solidFill.Elements().FirstOrDefault(e => e.LocalName == "schemeClr");
         if (scheme != null) color = ResolveSchemeColor(scheme);
 
@@ -834,12 +843,19 @@ public partial class WordHandler
         // Font
         var fonts = rProps.RunFonts;
         var font = fonts?.EastAsia?.Value ?? fonts?.Ascii?.Value ?? fonts?.HighAnsi?.Value;
-        if (font != null)
+        // Skip theme font references (e.g. "+mn-lt", "+mj-ea") — those are shorthand
+        // markers, not real font names; the theme-resolved value would already be in
+        // AsciiTheme etc. which we don't read here.
+        if (font != null && !font.StartsWith("+", StringComparison.Ordinal))
         {
             var fallback = GetChineseFontFallback(font);
+            // Always append a generic family so the run still renders with the right
+            // serif/sans-serif class when neither the primary nor the CJK fallback
+            // is installed (matters in headless browsers like Playwright).
+            var generic = IsLikelySerif(font) ? "serif" : "sans-serif";
             parts.Add(fallback != null
-                ? $"font-family:'{CssSanitize(font)}',{fallback}"
-                : $"font-family:'{CssSanitize(font)}'");
+                ? $"font-family:'{CssSanitize(font)}',{fallback},{generic}"
+                : $"font-family:'{CssSanitize(font)}',{generic}");
         }
 
         // Size (stored as half-points)
@@ -882,7 +898,8 @@ public partial class WordHandler
                     parts.Add("text-decoration-thickness:2px");
                 // Per-underline color via w:u w:color="RRGGBB"
                 var ulColor = rProps.Underline.Color?.Value;
-                if (!string.IsNullOrEmpty(ulColor) && !ulColor.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(ulColor) && !ulColor.Equals("auto", StringComparison.OrdinalIgnoreCase)
+                    && IsHexColor(ulColor))
                     parts.Add($"text-decoration-color:#{ulColor}");
             }
         }
@@ -967,7 +984,7 @@ public partial class WordHandler
         if (runShd != null && highlight == null) // don't override highlight
         {
             var fill = runShd.Fill?.Value;
-            if (fill != null && fill != "auto")
+            if (fill != null && fill != "auto" && IsHexColor(fill))
                 parts.Add($"background-color:#{fill}");
         }
 
@@ -981,7 +998,7 @@ public partial class WordHandler
                 var bdrSz = runBdr.Size?.Value ?? 4;
                 var bdrColor = runBdr.Color?.Value;
                 var px = Math.Max(1, bdrSz / 8.0);
-                var color = (bdrColor != null && bdrColor != "auto") ? $"#{bdrColor}" : "#000";
+                var color = (bdrColor != null && bdrColor != "auto" && IsHexColor(bdrColor)) ? $"#{bdrColor}" : "#000";
                 parts.Add($"border:{px:0.#}px solid {color};padding:0 2px");
             }
         }
@@ -1053,7 +1070,8 @@ public partial class WordHandler
 
                             if (isRadial)
                             {
-                                parts.Add($"background:radial-gradient(circle,{colors[0]},{colors[1]})");
+                                // CONSISTENCY(radial-gradient-extent): closest-side so gradient reaches shape edge (matches PPTX R2 fix).
+                                parts.Add($"background:radial-gradient(circle closest-side,{colors[0]},{colors[1]})");
                             }
                             else
                             {
@@ -1422,7 +1440,8 @@ public partial class WordHandler
 
         // Resolve color: try direct color, then themeColor with tint/shade
         string cssColor;
-        if (color != null && !color.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        if (color != null && !color.Equals("auto", StringComparison.OrdinalIgnoreCase)
+            && IsHexColor(color))
         {
             cssColor = $"#{color}";
         }
@@ -1457,7 +1476,7 @@ public partial class WordHandler
     {
         if (color == null) return null;
         var colorVal = color.Val?.Value;
-        if (colorVal != null && colorVal != "auto")
+        if (colorVal != null && colorVal != "auto" && IsHexColor(colorVal))
             return $"#{colorVal}";
         var tcName = color.ThemeColor?.InnerText;
         if (tcName != null && GetThemeColors().TryGetValue(tcName, out var tcHex))
@@ -1491,6 +1510,28 @@ public partial class WordHandler
         "white" => "#FFFFFF",
         _ => null
     };
+
+    /// <summary>
+    /// Heuristic: does this typeface name belong to the serif family?
+    /// Used to pick the generic CSS fallback (serif vs sans-serif) when neither
+    /// the primary font nor the CJK fallback is installed.
+    /// </summary>
+    private static bool IsLikelySerif(string font)
+    {
+        var f = font.ToLowerInvariant();
+        // Western serif faces
+        if (f.Contains("times") || f.Contains("serif") || f.Contains("georgia")
+            || f.Contains("cambria") || f.Contains("garamond") || f.Contains("palatino")
+            || f.Contains("book antiqua") || f.Contains("constantia") || f.Contains("didot")
+            || f.Contains("baskerville") || f.Contains("minion"))
+            return true;
+        // CJK serif (宋体 / Song / Ming / Mincho)
+        if (f.Contains("song") || f.Contains("ming") || f.Contains("mincho")
+            || f.Contains("fangsong") || font.Contains("宋") || font.Contains("仿宋")
+            || font.Contains("明朝"))
+            return true;
+        return false;
+    }
 
     /// <summary>
     /// Returns CSS fallback fonts for common Windows Chinese fonts that are unavailable on Mac.
@@ -1564,7 +1605,7 @@ public partial class WordHandler
                 ?.Elements<Style>().FirstOrDefault(s => s.StyleId?.Value == current);
             if (style == null) break;
             var cv = style.StyleRunProperties?.Color?.Val?.Value;
-            if (cv != null && cv != "auto") return $"#{cv}";
+            if (cv != null && cv != "auto" && IsHexColor(cv)) return $"#{cv}";
             var tc = style.StyleRunProperties?.Color?.ThemeColor?.InnerText;
             if (tc != null && GetThemeColors().TryGetValue(tc, out var tcHex)) return $"#{tcHex}";
             current = style.BasedOn?.Val?.Value;
@@ -1591,8 +1632,22 @@ public partial class WordHandler
         return null;
     }
 
-    private static string CssSanitize(string value) =>
-        Regex.Replace(value, @"[""'\\<>&;{}]", "");
+    // Strip every character that isn't a valid CSS identifier-ish character
+    // for font names. OOXML rFonts/theme attrs are attacker-controlled, so
+    // CssSanitize not only removes the obvious breakouts (" ' ; { } < > & \)
+    // but also parens, colons, slashes, and anything non-alpha so a name like
+    // `Arial";background:url(javascript:)//` can't appear as substring inside
+    // the inline style (a CSS parser would treat it as a font name there, but
+    // downstream safety checks still grep for the substring).
+    private static string CssSanitize(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        var sb = new StringBuilder(value.Length);
+        foreach (var c in value)
+            if (char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_' || c == '.')
+                sb.Append(c);
+        return sb.ToString();
+    }
 
     private static string JsStringLiteral(string? text)
     {
@@ -1699,6 +1754,8 @@ public partial class WordHandler
             transform-origin: left top; transition: transform 0.15s ease;
             }}
         .page-body {{ flex: 1; display: flex; flex-direction: column; text-autospace: ideograph-alpha ideograph-numeric; overflow-wrap: anywhere; {hyphensCss} }}
+        /* Multi-column sections: flex ignores column-count; switch to block. */
+        .page-body[style*=""column-count""] {{ display: block; }}
         .page-body > :first-child {{ margin-top: 0 !important; }}
         .page-body > img + h1, .page-body > img + img + h1 {{ margin-top: 0 !important; }}
         /* Tracked changes preview: w:del → gray strikethrough, w:ins → red.
@@ -1782,7 +1839,10 @@ public partial class WordHandler
         if (isWestern)
         {
             // Prefer theme-resolved CJK font (from supplemental font list)
-            var prefix = !string.IsNullOrEmpty(themeCjkFont) ? $", '{themeCjkFont}'" : "";
+            // CssSanitize the theme font name — theme1.xml is attacker-
+            // controlled and this value interpolates into font-family.
+            var safeTheme = !string.IsNullOrEmpty(themeCjkFont) ? CssSanitize(themeCjkFont) : "";
+            var prefix = !string.IsNullOrEmpty(safeTheme) ? $", '{safeTheme}'" : "";
             var lang = eastAsiaLang?.ToLowerInvariant() ?? "";
             if (lang.StartsWith("ja"))
                 return prefix + ", 'Hiragino Mincho ProN', 'Yu Mincho', 'MS Mincho'";

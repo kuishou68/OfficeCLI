@@ -566,6 +566,8 @@ public partial class ExcelHandler
                 var lk = key.ToLowerInvariant();
                 if (TrySetAnchorPosition(anchor, lk, value)) continue;
                 if (TrySetRotation(shape.ShapeProperties, lk, value)) continue;
+                if (TrySetShapeFlip(shape.ShapeProperties, lk, value)) continue;
+                if (TrySetShapeFontProp(shape, lk, value)) continue;
 
                 // For effects on shapes: check if fill=none → text-level, otherwise shape-level
                 if (lk is "shadow" or "glow" or "reflection" or "softedge")
@@ -696,6 +698,81 @@ public partial class ExcelHandler
                             };
                         }
                         break;
+                    case "valign":
+                    {
+                        var txBody = shape.TextBody;
+                        var bodyPr = txBody?.GetFirstChild<Drawing.BodyProperties>();
+                        if (bodyPr != null)
+                        {
+                            bodyPr.Anchor = value.ToLowerInvariant() switch
+                            {
+                                "top" or "t" => Drawing.TextAnchoringTypeValues.Top,
+                                "center" or "ctr" or "middle" or "m" or "c" => Drawing.TextAnchoringTypeValues.Center,
+                                "bottom" or "b" => Drawing.TextAnchoringTypeValues.Bottom,
+                                _ => throw new ArgumentException($"Invalid valign value: '{value}'. Valid values: top, center, bottom.")
+                            };
+                        }
+                        break;
+                    }
+                    case "gradientfill":
+                    {
+                        var spPr = shape.ShapeProperties;
+                        if (spPr != null)
+                        {
+                            spPr.RemoveAllChildren<Drawing.SolidFill>();
+                            spPr.RemoveAllChildren<Drawing.NoFill>();
+                            spPr.RemoveAllChildren<Drawing.GradientFill>();
+                            // CONSISTENCY(shape-gradient-fill): reuse the Add-branch parser so
+                            // shape Set accepts the same "C1-C2[-C3][:angle]" spec.
+                            spPr.AppendChild(BuildShapeGradientFill(value));
+                        }
+                        break;
+                    }
+                    case "line" or "border":
+                    {
+                        // CONSISTENCY(shape-line): mirror Add — accept "none" or "color[:width[:style]]".
+                        var spPr = shape.ShapeProperties;
+                        if (spPr == null) break;
+                        spPr.RemoveAllChildren<Drawing.Outline>();
+                        if (value.Equals("none", StringComparison.OrdinalIgnoreCase))
+                        {
+                            spPr.AppendChild(new Drawing.Outline(new Drawing.NoFill()));
+                            break;
+                        }
+                        var parts = value.Split(':');
+                        var (lRgb, _) = ParseHelpers.SanitizeColorForOoxml(parts[0]);
+                        var outline = new Drawing.Outline(
+                            new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = lRgb }));
+                        if (parts.Length > 1
+                            && double.TryParse(parts[1], System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out var wpt))
+                        {
+                            outline.Width = (int)Math.Round(wpt * 12700);
+                        }
+                        if (parts.Length > 2)
+                        {
+                            var dash = parts[2].ToLowerInvariant() switch
+                            {
+                                "dash" => Drawing.PresetLineDashValues.Dash,
+                                "dot" => Drawing.PresetLineDashValues.Dot,
+                                "dashdot" => Drawing.PresetLineDashValues.DashDot,
+                                "longdash" => Drawing.PresetLineDashValues.LargeDash,
+                                "solid" => Drawing.PresetLineDashValues.Solid,
+                                _ => (Drawing.PresetLineDashValues?)null
+                            };
+                            if (dash != null)
+                                outline.AppendChild(new Drawing.PresetDash { Val = dash });
+                        }
+                        spPr.AppendChild(outline);
+                        break;
+                    }
+                    case "alt" or "alttext" or "descr" or "description":
+                    {
+                        var altNv = shape.NonVisualShapeProperties?
+                            .GetFirstChild<XDR.NonVisualDrawingProperties>();
+                        if (altNv != null) altNv.Description = value;
+                        break;
+                    }
                     default:
                         shpUnsupported.Add(key);
                         break;
@@ -704,6 +781,42 @@ public partial class ExcelHandler
 
             drawingsPart.WorksheetDrawing.Save();
             return shpUnsupported;
+        }
+
+        // Handle /SheetName/slicer[N] — caption/style/columnCount/rowHeight/name
+        var slicerSetMatch = Regex.Match(cellRef, @"^slicer\[(\d+)\]$", RegexOptions.IgnoreCase);
+        if (slicerSetMatch.Success)
+        {
+            var slIdx = int.Parse(slicerSetMatch.Groups[1].Value);
+            if (!TryFindSlicerByIndex(worksheet, slIdx, out var slicer, out _) || slicer == null)
+                throw new ArgumentException($"slicer[{slIdx}] not found on sheet");
+
+            var slicersPart = worksheet.GetPartsOfType<SlicersPart>().FirstOrDefault();
+            var slUnsupported = new List<string>();
+            foreach (var (key, value) in properties)
+            {
+                switch (key.ToLowerInvariant())
+                {
+                    case "caption": slicer.Caption = value; break;
+                    case "style": slicer.Style = value; break;
+                    case "name": slicer.Name = value; break;
+                    case "rowheight":
+                        if (uint.TryParse(value, out var rh)) slicer.RowHeight = rh;
+                        else slUnsupported.Add(key);
+                        break;
+                    case "columncount":
+                        if (uint.TryParse(value, out var cc) && cc >= 1 && cc <= 20000)
+                            slicer.ColumnCount = cc;
+                        else slUnsupported.Add(key);
+                        break;
+                    default:
+                        slUnsupported.Add(key);
+                        break;
+                }
+            }
+            if (slicersPart?.Slicers != null) slicersPart.Slicers.Save(slicersPart);
+            SaveWorksheet(worksheet);
+            return slUnsupported;
         }
 
         // Handle /SheetName/table[N]
@@ -727,6 +840,7 @@ public partial class ExcelHandler
                     case "displayname": table.DisplayName = value; break;
                     case "headerrow": table.HeaderRowCount = IsTruthy(value) ? 1u : 0u; break;
                     case "totalrow":
+                    case "showtotals":
                         var totalRowEnabled = IsTruthy(value);
                         table.TotalsRowShown = totalRowEnabled;
                         table.TotalsRowCount = totalRowEnabled ? 1u : 0u;
@@ -741,10 +855,52 @@ public partial class ExcelHandler
                         });
                         break;
                     case "ref":
-                        table.Reference = value.ToUpperInvariant();
+                    {
+                        var newRef = value.ToUpperInvariant();
+                        // T5 — grow/shrink <x:tableColumns> to match the new column
+                        // count. Excel rejects the file when tableColumns.Count
+                        // mismatches the ref width. On grow, append default
+                        // ColumnN entries; on shrink, trim the trailing entries.
+                        var newParts = newRef.Split(':');
+                        if (newParts.Length == 2)
+                        {
+                            var (nsc, _) = ParseCellReference(newParts[0]);
+                            var (nec, _) = ParseCellReference(newParts[1]);
+                            int newColCount = ColumnNameToIndex(nec) - ColumnNameToIndex(nsc) + 1;
+                            var tc = table.GetFirstChild<TableColumns>();
+                            if (tc != null && newColCount > 0)
+                            {
+                                var cols = tc.Elements<TableColumn>().ToList();
+                                if (newColCount > cols.Count)
+                                {
+                                    var existingIds = cols.Select(c => c.Id?.Value ?? 0u).ToList();
+                                    var existingNames = new HashSet<string>(
+                                        cols.Select(c => c.Name?.Value ?? string.Empty),
+                                        StringComparer.OrdinalIgnoreCase);
+                                    uint nextId = existingIds.Count > 0 ? existingIds.Max() + 1 : 1u;
+                                    for (int i = cols.Count; i < newColCount; i++)
+                                    {
+                                        var baseName = $"Column{i + 1}";
+                                        var name = baseName;
+                                        int dedup = 2;
+                                        while (!existingNames.Add(name))
+                                            name = $"{baseName}{dedup++}";
+                                        tc.AppendChild(new TableColumn { Id = nextId++, Name = name });
+                                    }
+                                }
+                                else if (newColCount < cols.Count)
+                                {
+                                    for (int i = cols.Count - 1; i >= newColCount; i--)
+                                        cols[i].Remove();
+                                }
+                                tc.Count = (uint)newColCount;
+                            }
+                        }
+                        table.Reference = newRef;
                         var af = table.GetFirstChild<AutoFilter>();
-                        if (af != null) af.Reference = value.ToUpperInvariant();
+                        if (af != null) af.Reference = newRef;
                         break;
+                    }
                     case "showrowstripes" or "bandedrows" or "bandrows":
                     {
                         var si = table.GetFirstChild<TableStyleInfo>();
@@ -831,18 +987,36 @@ public partial class ExcelHandler
                 ?? throw new ArgumentException($"Comment [{cmtIndex}] not found");
 
             var cmtUnsupported = new List<string>();
+            // CONSISTENCY(xlsx/comment-font): C8 — font.* props on Set rewrite
+            // the single <x:r><x:rPr>, reusing BuildCommentRunProperties. When
+            // `text` and `font.*` appear together, text wins the run payload
+            // and font.* supplies the rPr. When only font.* appears (no text),
+            // preserve the existing run text and just rebuild rPr.
+            string? newCmtText = properties.TryGetValue("text", out var tVal) ? tVal : null;
+            bool hasFontProp = properties.Keys.Any(k =>
+                k.StartsWith("font.", StringComparison.OrdinalIgnoreCase));
+            if (newCmtText != null || hasFontProp)
+            {
+                string runText = newCmtText
+                    ?? string.Concat(cmtElement.CommentText?.Elements<Run>()
+                        .SelectMany(r => r.Elements<Text>()).Select(t => t.Text)
+                        ?? Array.Empty<string>());
+                cmtElement.CommentText = new CommentText(
+                    new Run(
+                        BuildCommentRunProperties(properties),
+                        new Text(runText) { Space = SpaceProcessingModeValues.Preserve }
+                    )
+                );
+            }
             foreach (var (key, value) in properties)
             {
                 switch (key.ToLowerInvariant())
                 {
                     case "text":
-                        cmtElement.CommentText = new CommentText(
-                            new Run(
-                                new RunProperties(new FontSize { Val = 9 }, new Color { Indexed = 81 },
-                                    new RunFont { Val = "Tahoma" }),
-                                new Text(value) { Space = SpaceProcessingModeValues.Preserve }
-                            )
-                        );
+                        // Already applied above.
+                        break;
+                    case var k when k.StartsWith("font."):
+                        // Already applied above.
                         break;
                     case "ref":
                         // Update cell reference (like POI's XSSFComment.setAddress)
@@ -1191,6 +1365,10 @@ public partial class ExcelHandler
         // rows with no remaining cells are pruned from XML. This keeps maxRow correct
         // and produces "remove" watch patches instead of "replace" for cleared rows.
         PruneEmptyCell(cell);
+        // CONSISTENCY(xlsx/table-autoexpand): eager post-write auto-grow —
+        // only fires when the cell still carries a value/formula after prune.
+        if (cell.Parent != null && (cell.CellValue != null || cell.CellFormula != null || cell.InlineString != null))
+            MaybeExpandTablesForCell(worksheet, cellRef);
         // Any mutation to a cell (value, formula, clear) can invalidate the calc chain
         DeleteCalcChainIfPresent();
         SaveWorksheet(worksheet);
@@ -1241,6 +1419,16 @@ public partial class ExcelHandler
             switch (key.ToLowerInvariant())
             {
                 case "value" or "text":
+                    // R13-1: enforce Excel's 32767-char per-cell limit.
+                    EnsureCellValueLength(value, cell.CellReference?.Value);
+                    // R13-3: warn if both value= and formula= supplied — formula
+                    // takes precedence below (explicit-formula case runs last and
+                    // clears CellValue), so the literal value is silently discarded.
+                    if (properties.Any(p => p.Key.Equals("formula", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        Console.Error.WriteLine(
+                            "Warning: Both value= and formula= supplied — using formula, value ignored.");
+                    }
                     // Auto-detect formula: value starting with '=' is treated as formula
                     if (value.StartsWith('=') && value.Length > 1)
                         goto case "formula";
@@ -1268,10 +1456,8 @@ public partial class ExcelHandler
                             .Any(v => v is "number" or "num");
 
                         // Auto-detect ISO date (only if user did NOT explicitly set type=string)
-                        if (!explicitTypeIsString && DateTime.TryParseExact(cellValue,
-                            new[] { "yyyy-MM-dd", "yyyy/MM/dd", "yyyy-MM-dd HH:mm:ss" },
-                            System.Globalization.CultureInfo.InvariantCulture,
-                            System.Globalization.DateTimeStyles.None, out var dt))
+                        // R13-2: accept date-with-time variants (T and space separators).
+                        if (!explicitTypeIsString && TryParseIsoDateFlexible(cellValue, out var dt))
                         {
                             cell.CellValue = new CellValue(dt.ToOADate().ToString(System.Globalization.CultureInfo.InvariantCulture));
                             cell.DataType = null;
@@ -1286,6 +1472,25 @@ public partial class ExcelHandler
                             cell.CellValue = new CellValue(cellValue);
                             cell.DataType = new EnumValue<CellValues>(CellValues.String);
                         }
+                        else if (explicitTypeIsString)
+                        {
+                            // R15-2: honor explicit type=string even for
+                            // numeric-looking literals. Without this, Excel
+                            // renders 123 as a number despite user intent.
+                            cell.CellValue = new CellValue(cellValue);
+                            cell.DataType = new EnumValue<CellValues>(CellValues.String);
+                        }
+                        else if (explicitTypeIsNumber)
+                        {
+                            // R15-2: honor explicit type=number — refuse
+                            // non-numeric values rather than silently storing
+                            // as string.
+                            if (!double.TryParse(cellValue, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _))
+                                throw new ArgumentException(
+                                    $"Cannot store '{cellValue}' as number; use type=string or remove type=");
+                            cell.CellValue = new CellValue(cellValue);
+                            cell.DataType = null;
+                        }
                         else
                         {
                             cell.CellValue = new CellValue(cellValue);
@@ -1297,7 +1502,7 @@ public partial class ExcelHandler
                     }
                     break;
                 case "formula":
-                    cell.CellFormula = new CellFormula(value.TrimStart('='));
+                    cell.CellFormula = new CellFormula(Core.ModernFunctionQualifier.Qualify(value.TrimStart('=')));
                     // Try to evaluate and cache the result immediately
                     var evalSheetData = GetSheet(worksheet).GetFirstChild<SheetData>();
                     var evaluator = new Core.FormulaEvaluator(evalSheetData!, _doc.WorkbookPart);
@@ -1354,7 +1559,9 @@ public partial class ExcelHandler
                         "number" or "num" => null,
                         "boolean" or "bool" => new EnumValue<CellValues>(CellValues.Boolean),
                         "date" => null, // Dates are stored as numbers; format is applied via numberformat below
-                        _ => throw new ArgumentException($"Invalid cell 'type' value '{value}'. Valid types: string, number, boolean, date.")
+                        // CONSISTENCY(cell-type-parity): accept `error`/`err` as in Add.
+                        "error" or "err" => new EnumValue<CellValues>(CellValues.Error),
+                        _ => throw new ArgumentException($"Invalid cell 'type' value '{value}'. Valid types: string, number, boolean, date, error.")
                     };
                     // Convert cell value for boolean type
                     if (value.ToLowerInvariant() is "boolean" or "bool" && cell.CellValue != null)
@@ -1377,7 +1584,7 @@ public partial class ExcelHandler
                 case "arrayformula":
                 {
                     var arrRef = properties.GetValueOrDefault("ref", cellRef);
-                    cell.CellFormula = new CellFormula(value.TrimStart('='))
+                    cell.CellFormula = new CellFormula(Core.ModernFunctionQualifier.Qualify(value.TrimStart('=')))
                     {
                         FormulaType = CellFormulaValues.Array,
                         Reference = arrRef
@@ -1399,8 +1606,6 @@ public partial class ExcelHandler
                     }
                     else
                     {
-                        var hlUri = new Uri(value, UriKind.RelativeOrAbsolute);
-                        var hlRel = worksheet.AddHyperlinkRelationship(hlUri, isExternal: true);
                         if (hyperlinksEl == null)
                         {
                             hyperlinksEl = new Hyperlinks();
@@ -1409,8 +1614,61 @@ public partial class ExcelHandler
                         hyperlinksEl.Elements<Hyperlink>()
                             .Where(h => h.Reference?.Value?.Equals(cellRef, StringComparison.OrdinalIgnoreCase) == true)
                             .ToList().ForEach(h => h.Remove());
-                        hyperlinksEl.AppendChild(new Hyperlink { Reference = cellRef.ToUpperInvariant(), Id = hlRel.Id });
+                        // H2: optional tooltip/screenTip from sibling props.
+                        var setHlTip = properties.GetValueOrDefault("tooltip")
+                            ?? properties.GetValueOrDefault("screenTip")
+                            ?? properties.GetValueOrDefault("screentip");
+                        if (value.StartsWith("#"))
+                        {
+                            // Internal target (sheet cell or named range) is
+                            // written as an in-document hyperlink via the
+                            // `location` attribute, no relationship/target.
+                            var location = value.Substring(1);
+                            var hl = new Hyperlink
+                            {
+                                Reference = cellRef.ToUpperInvariant(),
+                                Location = location
+                            };
+                            if (!string.IsNullOrEmpty(setHlTip)) hl.Tooltip = setHlTip;
+                            hyperlinksEl.AppendChild(hl);
+                        }
+                        else
+                        {
+                            var hlUri = new Uri(value, UriKind.RelativeOrAbsolute);
+                            var hlRel = worksheet.AddHyperlinkRelationship(hlUri, isExternal: true);
+                            var hl = new Hyperlink { Reference = cellRef.ToUpperInvariant(), Id = hlRel.Id };
+                            if (!string.IsNullOrEmpty(setHlTip)) hl.Tooltip = setHlTip;
+                            hyperlinksEl.AppendChild(hl);
+                        }
+                        // H3: apply the built-in "Hyperlink" cellStyle (blue +
+                        // underline) if the cell has no user-assigned style.
+                        // CONSISTENCY(hyperlink-cellstyle): preserve an
+                        // explicit StyleIndex the user already set.
+                        if (cell.StyleIndex == null || cell.StyleIndex.Value == 0)
+                        {
+                            var wbPart = _doc.WorkbookPart
+                                ?? throw new InvalidOperationException("Workbook not found");
+                            var styleManager = new ExcelStyleManager(wbPart);
+                            cell.StyleIndex = styleManager.EnsureHyperlinkCellStyle();
+                            _dirtyStylesheet = true;
+                        }
                     }
+                    break;
+                }
+                case "tooltip":
+                case "screentip":
+                {
+                    // H2: tooltip may also be applied to an EXISTING hyperlink.
+                    var ws = GetSheet(worksheet);
+                    var hyperlinksEl = ws.GetFirstChild<Hyperlinks>();
+                    var existing = hyperlinksEl?.Elements<Hyperlink>()
+                        .FirstOrDefault(h => h.Reference?.Value?.Equals(cellRef, StringComparison.OrdinalIgnoreCase) == true);
+                    if (existing == null)
+                    {
+                        unsupported.Add($"tooltip (no hyperlink exists on {cellRef}; add a link first)");
+                        break;
+                    }
+                    existing.Tooltip = string.IsNullOrEmpty(value) ? null : value;
                     break;
                 }
                 default:
@@ -1569,6 +1827,12 @@ public partial class ExcelHandler
                         var existingPane = sheetView.GetFirstChild<Pane>();
                         existingPane?.Remove();
 
+                        // R18-B3: freeze=A1 means "no freeze". Emitting a <pane> with
+                        // no xSplit/ySplit produces invalid OOXML (Excel repairs on
+                        // open). Treat A1 as a no-op after clearing the existing pane.
+                        if (colSplit <= 0 && rowSplit <= 0)
+                            break;
+
                         var activePane = (colSplit > 0 && rowSplit > 0) ? PaneValues.BottomRight
                             : (rowSplit > 0) ? PaneValues.BottomLeft
                             : PaneValues.TopRight;
@@ -1588,18 +1852,25 @@ public partial class ExcelHandler
                 }
                 case "merge":
                 {
-                    // Sheet-level merge: value is the range to merge (e.g., "A1:A3")
-                    var rangeRef = value.ToUpperInvariant();
+                    // Sheet-level merge: value is the range(s) to merge (e.g., "A1:A3" or
+                    // "A1:D1,B3:B5" for multiple ranges).
+                    // R2-1: Split comma-separated ranges into separate <mergeCell> elements;
+                    // Excel rejects a single <mergeCell ref="A1:D1,B3:B5"/>.
                     var mergeCells = ws.GetFirstChild<MergeCells>();
                     if (mergeCells == null)
                     {
                         mergeCells = new MergeCells();
                         ws.AppendChild(mergeCells);
                     }
-                    var existing = mergeCells.Elements<MergeCell>()
-                        .FirstOrDefault(m => m.Reference?.Value?.Equals(rangeRef, StringComparison.OrdinalIgnoreCase) == true);
-                    if (existing == null)
-                        mergeCells.AppendChild(new MergeCell { Reference = rangeRef });
+                    foreach (var part in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        var rangeRef = part.ToUpperInvariant();
+                        var existing = mergeCells.Elements<MergeCell>()
+                            .FirstOrDefault(m => m.Reference?.Value?.Equals(rangeRef, StringComparison.OrdinalIgnoreCase) == true);
+                        if (existing == null)
+                            mergeCells.AppendChild(new MergeCell { Reference = rangeRef });
+                    }
+                    mergeCells.Count = (uint)mergeCells.Elements<MergeCell>().Count();
                     break;
                 }
                 case "autofilter":
@@ -1699,8 +1970,20 @@ public partial class ExcelHandler
                     sheetPr.RemoveAllChildren<TabColor>();
                     if (!value.Equals("none", StringComparison.OrdinalIgnoreCase))
                     {
-                        var colorHex = OfficeCli.Core.ParseHelpers.NormalizeArgbColor(value);
-                        sheetPr.AppendChild(new TabColor { Rgb = new HexBinaryValue(colorHex) });
+                        // CONSISTENCY(scheme-color): accept scheme-color names
+                        // ("accent1"-"accent6", "lt1", "dk1", ...) by mapping
+                        // them to TabColor.Theme index. Otherwise fall back to
+                        // the numeric color parser for hex/named/rgb() inputs.
+                        var themeIndex = ExcelSchemeColorNameToThemeIndex(value);
+                        if (themeIndex.HasValue)
+                        {
+                            sheetPr.AppendChild(new TabColor { Theme = (UInt32Value)themeIndex.Value });
+                        }
+                        else
+                        {
+                            var colorHex = OfficeCli.Core.ParseHelpers.NormalizeArgbColor(value);
+                            sheetPr.AppendChild(new TabColor { Rgb = new HexBinaryValue(colorHex) });
+                        }
                     }
                     break;
                 }
@@ -1984,6 +2267,7 @@ public partial class ExcelHandler
                         {
                             mergeCells.AppendChild(new MergeCell { Reference = rangeRef });
                         }
+                        mergeCells.Count = (uint)mergeCells.Elements<MergeCell>().Count();
                     }
                     else
                     {
@@ -1998,6 +2282,8 @@ public partial class ExcelHandler
                             // Remove empty MergeCells element
                             if (!mergeCells.HasChildren)
                                 mergeCells.Remove();
+                            else
+                                mergeCells.Count = (uint)mergeCells.Elements<MergeCell>().Count();
                         }
                     }
                     break;
@@ -2702,7 +2988,7 @@ public partial class ExcelHandler
             switch (key.ToLowerInvariant())
             {
                 case "width":
-                    col.Width = ParseHelpers.SafeParseDouble(value, "width");
+                    col.Width = ParseColWidthChars(value);
                     col.CustomWidth = true;
                     break;
                 case "hidden":
@@ -2710,7 +2996,8 @@ public partial class ExcelHandler
                         || value == "1" || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
                     break;
                 case "outline" or "outlinelevel" or "group":
-                    if (!byte.TryParse(value, out var colOutline))
+                    // DEFERRED(xlsx/row-height-validation) RC2: Excel outline level max is 7.
+                    if (!byte.TryParse(value, out var colOutline) || colOutline > 7)
                         throw new ArgumentException($"Invalid 'outline' value: '{value}'. Expected an integer 0-7 (outline/group level).");
                     col.OutlineLevel = colOutline;
                     break;
@@ -2850,9 +3137,7 @@ public partial class ExcelHandler
             switch (key.ToLowerInvariant())
             {
                 case "height":
-                    if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var heightVal) || double.IsNaN(heightVal) || double.IsInfinity(heightVal))
-                        throw new ArgumentException($"Invalid 'height' value: '{value}'. Expected a finite number (row height in points, e.g. 15.75).");
-                    row.Height = heightVal;
+                    row.Height = ParseRowHeightPoints(value);
                     row.CustomHeight = true;
                     break;
                 case "hidden":
@@ -2860,7 +3145,8 @@ public partial class ExcelHandler
                         || value == "1" || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
                     break;
                 case "outline" or "outlinelevel" or "group":
-                    if (!byte.TryParse(value, out var outlineVal))
+                    // DEFERRED(xlsx/row-height-validation) RC2: Excel outline level max is 7.
+                    if (!byte.TryParse(value, out var outlineVal) || outlineVal > 7)
                         throw new ArgumentException($"Invalid 'outline' value: '{value}'. Expected an integer 0-7 (outline/group level).");
                     row.OutlineLevel = outlineVal;
                     break;

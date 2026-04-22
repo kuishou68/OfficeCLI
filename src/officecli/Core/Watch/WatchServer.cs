@@ -139,38 +139,86 @@ internal class WatchServer : IDisposable
     }
 
     /// <summary>
+    /// Path of the on-disk marker that records {pid, port} for a running
+    /// watch. Used by <see cref="GetExistingWatchPort"/> and
+    /// <see cref="IsWatching"/> to answer "is anyone watching this file?"
+    /// without a pipe round-trip. Same hash key as the pipe name — one
+    /// file ↔ one pipe ↔ one marker.
+    /// </summary>
+    public static string GetWatchMarkerPath(string filePath)
+    {
+        return Path.Combine(Path.GetTempPath(), GetWatchPipeName(filePath) + ".port");
+    }
+
+    /// <summary>
     /// Check if another watch process is already running for this file.
     /// Returns the port number if running, or null if not.
+    ///
+    /// Implementation: reads the on-disk marker file ({pid}\n{port}\n) and
+    /// validates the pid is still alive. Replaces the pre-1.0.51 pipe ping
+    /// probe, which cost ~100ms and falsely reported "not watching" when
+    /// the pipe server was momentarily busy with another connection.
     /// </summary>
     public static int? GetExistingWatchPort(string filePath)
     {
+        var markerPath = GetWatchMarkerPath(filePath);
         try
         {
-            int? result = null;
-            var task = Task.Run(() =>
+            if (!File.Exists(markerPath)) return null;
+            var lines = File.ReadAllLines(markerPath);
+            if (lines.Length < 2) return null;
+            if (!int.TryParse(lines[0], out var pid)) return null;
+            if (!int.TryParse(lines[1], out var port)) return null;
+            if (!IsProcessAlive(pid))
             {
-                var pipeName = GetWatchPipeName(filePath);
-                using var client = new System.IO.Pipes.NamedPipeClientStream(".", pipeName, System.IO.Pipes.PipeDirection.InOut);
-                client.Connect(100);
-                var noBom = new UTF8Encoding(false);
-                using var writer = new StreamWriter(client, noBom, leaveOpen: true) { AutoFlush = true };
-                writer.WriteLine("ping");
-                writer.Flush();
-                using var reader = new StreamReader(client, noBom, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
-                var response = reader.ReadLine();
-                result = int.TryParse(response, out var port) ? port : 0;
-            });
-            return task.Wait(TimeSpan.FromSeconds(2)) ? result : null;
+                // Stale marker — writer crashed or was killed without cleanup.
+                // Best-effort remove so the caller can start a fresh watch.
+                try { File.Delete(markerPath); } catch { }
+                return null;
+            }
+            return port;
         }
         catch
         {
-            return null; // not running
+            return null;
         }
     }
 
     public static bool IsWatching(string filePath)
     {
         return GetExistingWatchPort(filePath).HasValue;
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+    }
+
+    private void WriteMarker()
+    {
+        var markerPath = GetWatchMarkerPath(_filePath);
+        try
+        {
+            File.WriteAllText(markerPath,
+                $"{System.Diagnostics.Process.GetCurrentProcess().Id}\n{_port}\n");
+        }
+        catch { /* best-effort; IsWatching just reports false if marker absent */ }
+    }
+
+    private void DeleteMarker()
+    {
+        try
+        {
+            var markerPath = GetWatchMarkerPath(_filePath);
+            if (File.Exists(markerPath)) File.Delete(markerPath);
+        }
+        catch { /* best-effort cleanup */ }
     }
 
     public async Task RunAsync(CancellationToken externalToken = default)
@@ -187,6 +235,7 @@ internal class WatchServer : IDisposable
         var token = linkedCts.Token;
 
         _tcpListener.Start();
+        WriteMarker();
         Console.WriteLine($"Watch: http://localhost:{_port}");
         Console.WriteLine($"Watching: {_filePath}");
         Console.WriteLine("Press Ctrl+C to stop.");
@@ -335,6 +384,10 @@ internal class WatchServer : IDisposable
         }
         catch { }
 
+        // 4b. Delete the on-disk watch marker so external IsWatching() probes
+        //     immediately see "no watch running".
+        DeleteMarker();
+
         // 5. Delete the stale CoreFxPipe_ socket on Unix. .NET does not
         //    do this on its own (BUG-BT-003 — fuzzer found 302 stale
         //    files). Run here in StopAsync rather than Dispose so it
@@ -426,11 +479,6 @@ internal class WatchServer : IDisposable
                     // also cleans up CoreFxPipe_ socket on Unix.
                     _ = StopAsync();
                     return;
-                }
-                else if (message == "ping")
-                {
-                    // Return port so callers can find the existing watch URL
-                    await writer.WriteLineAsync(_port.ToString().AsMemory(), token);
                 }
                 else if (message == "get-selection")
                 {
@@ -537,9 +585,13 @@ internal class WatchServer : IDisposable
                 }
             }
 
-            // Excel: try row-level diff instead of full refresh
+            // Excel: try row-level diff instead of full refresh.
+            // Skip when table chrome (colgroup/thead/table width) changed —
+            // row patches can't express those changes, so fall through to
+            // full-action so the browser rebuilds the whole body.
             if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
-                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-row=\""))
+                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-row=\"")
+                && TableChromeSignature(oldHtml) == TableChromeSignature(msg.FullHtml))
             {
                 var excelPatches = ComputeExcelPatches(oldHtml, msg.FullHtml);
                 var oldStyle = ExtractStyleBlock(oldHtml);
@@ -1079,7 +1131,11 @@ internal class WatchServer : IDisposable
     /// <summary>Find the start/end character positions of a slide-container div in the HTML.</summary>
     private static (int Start, int End) FindSlideFragmentRange(string html, int slideNum)
     {
-        var marker = $"data-slide=\"{slideNum}\"";
+        // The sidebar also emits `<div class="thumb" data-slide="N">`, so matching
+        // on `data-slide="N"` alone hits the thumb first and leaves the main
+        // slide-container stale — user-visible as a white main view on every
+        // incremental update. Pin to the slide-container class.
+        var marker = $"class=\"slide-container\" data-slide=\"{slideNum}\"";
         var idx = html.IndexOf(marker, StringComparison.Ordinal);
         if (idx < 0) return (-1, -1);
 
@@ -1244,6 +1300,33 @@ internal class WatchServer : IDisposable
         var rx = new System.Text.RegularExpressions.Regex(@"data-from-(?:row|col)=""(\d+)""");
         foreach (System.Text.RegularExpressions.Match m in rx.Matches(html))
             sb.Append(m.Value).Append(',');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Signature of Excel table chrome — concatenates each sheet's &lt;colgroup&gt;,
+    /// &lt;thead&gt;, and the &lt;table&gt; open tag (which carries table width style).
+    /// Row-level patches only swap &lt;tr&gt; nodes, so if this signature changes
+    /// between old and new HTML (column added/removed, column width changed,
+    /// thead style changed) the browser needs a full body refresh — otherwise
+    /// new headers/widths stay stale until a manual reload.
+    /// </summary>
+    private static string TableChromeSignature(string html)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(
+                html, @"<colgroup>.*?</colgroup>",
+                System.Text.RegularExpressions.RegexOptions.Singleline))
+            sb.Append(m.Value).Append('|');
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(
+                html, @"<thead>.*?</thead>",
+                System.Text.RegularExpressions.RegexOptions.Singleline))
+            sb.Append(m.Value).Append('|');
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(html, @"<table[^>]*>"))
+            sb.Append(m.Value).Append('|');
         return sb.ToString();
     }
 
