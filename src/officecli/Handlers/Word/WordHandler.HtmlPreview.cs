@@ -336,8 +336,14 @@ public partial class WordHandler
         sb.AppendLine("  var ftplEven=" + JsStringLiteral(pageTemplates.EvenFooterTemplate) + ";");
         sb.AppendLine(@"
   function shouldScalePages(){
-    try{return window.top===window.self;}
-    catch(e){return false;}
+    try{
+      // Embedded previews (for example Cove's iframe-based panel) still need
+      // the same fit-to-width behavior as the standalone HTML view.
+      // Keep an explicit opt-out for future hosts that truly need native width.
+      if(window.__officecliDisablePageScaling===true)return false;
+      if(document.body&&document.body.getAttribute('data-officecli-scale')==='off')return false;
+    }catch(e){}
+    return true;
   }
 
   function pickPageTemplate(first, odd, even, pageNum){
