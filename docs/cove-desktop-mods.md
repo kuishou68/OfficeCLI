@@ -252,6 +252,25 @@
 
 ---
 
+### 13. 嵌入态 DOCX HTML 预览默认启用 fit-to-width 缩放
+
+- **What**：修改 `src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs` 的 `shouldScalePages()`：不再用 `window.top === window.self` 限制缩放只在顶层窗口启用，而是默认返回 `true`；同时保留两个显式关闭开关：`window.__officecliDisablePageScaling === true` 和 `document.body[data-officecli-scale='off']`
+- **Why**：
+  - `v1.0.48-cove.1` 的 HTML 预览在 iframe 嵌入态会命中 `window.top !== window.self`，导致 `scalePages()` 被完全跳过
+  - Cove 的 DOCX 预览正是 `srcdoc + iframe` 嵌入，所以横向页面会按原始页宽渲染，预览面板里看不完整
+  - 之前条目 9 里的嵌入态缩放限制更适合“避免首屏宽度跳变”的场景，但对固定宽度预览面板来说，完整预览文档优先级更高
+- **Solves**：
+  - Cove 预览面板里的横向 DOCX 页面会像独立 HTML 预览一样自动 fit 到面板宽度
+  - 纵向 / 横向文档都能在不改窗口宽度的前提下完整预览页面
+  - 未来若其他宿主确实需要保留原始页宽，仍可通过显式开关关闭缩放
+- **Location**：`src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs` `shouldScalePages`
+- **Added**：2026-04-22，branch `feat/embedded-docx-scale`，commit `8dbeec5`
+- **Risk**：
+  - 仅影响 `view ... html` 预览层，不影响 DOCX 写回
+  - 依赖“iframe 中保持原始页宽”的宿主会看到行为变化；这类宿主需要显式设置关闭开关
+
+---
+
 ## 流程
 
 1. **新增魔改**：先更新 `OfficeCLI/docs/cove-desktop-mods.md`，再同步本文件；代码处加 `// MOD(#N): see cove-desktop-mods.md`

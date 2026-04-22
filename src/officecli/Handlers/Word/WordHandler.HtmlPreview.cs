@@ -337,6 +337,7 @@ public partial class WordHandler
         sb.AppendLine(@"
   function shouldScalePages(){
     try{
+      // MOD(#13): see docs/cove-desktop-mods.md
       // Embedded previews (for example Cove's iframe-based panel) still need
       // the same fit-to-width behavior as the standalone HTML view.
       // Keep an explicit opt-out for future hosts that truly need native width.
