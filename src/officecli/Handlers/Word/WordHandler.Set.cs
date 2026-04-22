@@ -64,7 +64,8 @@ public partial class WordHandler
                 if (k is "style" or "alignment" or "align" or "firstlineindent" or "leftindent" or "indentleft"
                     or "indent" or "rightindent" or "indentright" or "hangingindent" or "spacebefore"
                     or "spaceafter" or "linespacing" or "keepnext" or "keeplines" or "pagebreakbefore"
-                    or "widowcontrol" or "liststyle" or "start" or "text" or "formula")
+                    or "widowcontrol" or "liststyle" or "start" or "text" or "formula"
+                    or "contextualspacing")
                     paraProps[key] = value;
                 else
                     formatProps[key] = value;
@@ -733,6 +734,15 @@ public partial class WordHandler
                         sp4.LineRule = isMultiplier
                             ? new DocumentFormat.OpenXml.EnumValue<LineSpacingRuleValues>(LineSpacingRuleValues.Auto)
                             : new DocumentFormat.OpenXml.EnumValue<LineSpacingRuleValues>(LineSpacingRuleValues.Exact);
+                        break;
+                    }
+                    case "contextualspacing" or "contextualSpacing":
+                    {
+                        var pPrCs = style.StyleParagraphProperties ?? EnsureStyleParagraphProperties(style);
+                        if (IsTruthy(value))
+                            pPrCs.ContextualSpacing ??= new ContextualSpacing();
+                        else
+                            pPrCs.ContextualSpacing = null;
                         break;
                     }
                     case "pbdr.top" or "pbdr.bottom" or "pbdr.left" or "pbdr.right" or "pbdr.between" or "pbdr.bar" or "pbdr.all" or "pbdr":
@@ -2474,6 +2484,10 @@ public partial class WordHandler
             case "widowcontrol" or "widoworphan":
                 if (IsTruthy(value)) pProps.WidowControl ??= new WidowControl();
                 else pProps.WidowControl = new WidowControl { Val = false };
+                return true;
+            case "contextualspacing" or "contextualSpacing":
+                if (IsTruthy(value)) pProps.ContextualSpacing ??= new ContextualSpacing();
+                else pProps.ContextualSpacing = null;
                 return true;
             case "shading" or "shd":
                 var shdParts = value.Split(';');

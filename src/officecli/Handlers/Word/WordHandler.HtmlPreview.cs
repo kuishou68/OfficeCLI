@@ -37,6 +37,10 @@ public partial class WordHandler
         public bool LineBreakEnabled { get; set; }    // whether line-break tracking is active
         public double DefaultFontSizePt { get; set; } // default font size for width estimation
 
+        // Tab positioning: count tabs seen in current paragraph to look up Nth tab stop.
+        // Reset per paragraph in RenderParagraphContentHtml.
+        public int CurrentParagraphTabIndex { get; set; }
+
         public void ResetLineForParagraph(double contentWidthPt, double firstLineIndentPt, double defaultSizePt)
         {
             LineWidthPt = contentWidthPt - firstLineIndentPt;
@@ -105,7 +109,8 @@ public partial class WordHandler
         sb.AppendLine("<style>");
         sb.AppendLine(GenerateWordCss(pgLayout, docDef));
         sb.AppendLine("</style>");
-        // Load document fonts: local files > local() > Google Fonts
+        // Load document fonts: @font-face with metric overrides for all fonts,
+        // Google Fonts only for non-system fonts.
         var docFonts = CollectDocumentFonts();
         if (docFonts.Count > 0)
         {
@@ -116,9 +121,19 @@ public partial class WordHandler
                 sb.Append(fontFaces);
                 sb.AppendLine("</style>");
             }
-            var families = string.Join("&", docFonts.Select(f =>
-                $"family={f.Replace(' ', '+')}:ital,wght@0,400;0,700;1,400;1,700"));
-            sb.AppendLine($"<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?{families}&display=swap\" onerror=\"this.remove()\">");
+            // Filter out system fonts for Google Fonts loading (they're already local)
+            var googleFonts = docFonts.Where(f =>
+                !f.Equals("Arial", StringComparison.OrdinalIgnoreCase)
+                && !f.Equals("Times New Roman", StringComparison.OrdinalIgnoreCase)
+                && !f.Equals("Tahoma", StringComparison.OrdinalIgnoreCase)
+                && !f.Equals("Courier New", StringComparison.OrdinalIgnoreCase)
+                && !f.StartsWith("Symbol") && !f.StartsWith("Wingding")).ToList();
+            if (googleFonts.Count > 0)
+            {
+                var families = string.Join("&", googleFonts.Select(f =>
+                    $"family={f.Replace(' ', '+')}:ital,wght@0,400;0,700;1,400;1,700"));
+                sb.AppendLine($"<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?{families}&display=swap\" onerror=\"this.remove()\">");
+            }
         }
         // KaTeX for math rendering (graceful degradation: shows raw LaTeX when offline)
         sb.AppendLine("<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css\" onerror=\"this.remove()\">");
@@ -127,7 +142,6 @@ public partial class WordHandler
         sb.AppendLine("<body>");
 
         // Render body into temporary buffer, then split on page breaks
-        var maxW = $"width:{pgLayout.WidthPt:0.#}pt";
         var bodySb = new StringBuilder();
         _ctx.RenderingBody = true;
         RenderBodyHtml(bodySb, body);
@@ -178,7 +192,6 @@ public partial class WordHandler
 
         // Parse page filter (e.g. "1", "2-5", "1,3,5", "2-4,7")
         HashSet<int>? requestedPages = null;
-        int totalServerPages = pageList.Count;
         if (!string.IsNullOrWhiteSpace(pageFilter))
         {
             requestedPages = new HashSet<int>();
@@ -196,16 +209,72 @@ public partial class WordHandler
             }
         }
 
+        // Section-level multi-column layout: w:cols num=N sep=true
+        var sectCols = _doc.MainDocumentPart?.Document?.Body?.GetFirstChild<SectionProperties>()?.GetFirstChild<Columns>();
+        var colCount = sectCols?.ColumnCount?.Value ?? 1;
+        var colSep = sectCols?.Separator?.Value == true;
+        var colSpacing = sectCols?.Space?.Value;
+        var colBodyStyle = colCount > 1
+            ? $" style=\"column-count:{colCount}"
+                + (colSep ? ";column-rule:1px solid #000" : "")
+                + (int.TryParse(colSpacing, out var csp) && csp > 0 ? $";column-gap:{csp / 20.0:0.##}pt" : "")
+                + "\""
+            : "";
+
+        // Per-section page layout (#7a00): each page carries one or more
+        // <!--SECT:N--> markers inserted by RenderBodyHtml. The last marker
+        // seen (inclusive of this page) decides the page's size/margins;
+        // pages with no marker inherit from the previous page.
+        var sections = CollectSections(body);
+        var sectRegex = new Regex(@"<!--SECT:(\d+)-->");
+        var activeLayout = pgLayout;
+        // #10: per-section pgNumType — w:start resets the displayed page
+        // counter at the section boundary; w:fmt swaps the number format
+        // (decimalZero, upperRoman, …) applied to PAGE substitutions.
+        int displayedPageNum = 0;
+        string displayedFmt = "decimal";
         for (int i = 0; i < pageList.Count; i++)
         {
             var pageNumber = i + 1;
+            var pgContent = pageList[i];
+            var sectMatches = sectRegex.Matches(pgContent);
+            if (sectMatches.Count > 0)
+            {
+                var lastIdx = int.Parse(sectMatches[^1].Groups[1].Value);
+                if (lastIdx >= 0 && lastIdx < sections.Count)
+                {
+                    activeLayout = GetPageLayoutFor(sections[lastIdx]);
+                    var pgNumType = sections[lastIdx].GetFirstChild<PageNumberType>();
+                    if (pgNumType?.Start?.Value is int startVal)
+                        displayedPageNum = startVal - 1; // will ++ below
+                    // Open XML SDK v3+: Enum.ToString() returns a
+                    // debug string like "NumberFormatValues { }"; use
+                    // InnerText to get the XML-level token ("decimalZero").
+                    if (pgNumType?.Format?.InnerText is { Length: > 0 } fmtStr)
+                        displayedFmt = fmtStr;
+                }
+                pgContent = sectRegex.Replace(pgContent, "");
+                pageList[i] = pgContent;
+            }
+            displayedPageNum++;
+            // Per-page inline style carries full geometry (width / min-height
+            // / padding) so sections with different page sizes or margins
+            // override the base .page CSS rules.
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var pageStyle =
+                $"width:{activeLayout.WidthPt.ToString("0.#", ci)}pt;" +
+                $"min-height:{activeLayout.HeightPt.ToString("0.#", ci)}pt;" +
+                $"padding:{activeLayout.MarginTopPt.ToString("0.#", ci)}pt " +
+                $"{activeLayout.MarginRightPt.ToString("0.#", ci)}pt " +
+                $"{activeLayout.MarginBottomPt.ToString("0.#", ci)}pt " +
+                $"{activeLayout.MarginLeftPt.ToString("0.#", ci)}pt";
             sb.AppendLine($"<div class=\"page-wrapper\" data-section=\"{i + 1}\">");
-            sb.AppendLine($"<div class=\"page\" data-page=\"{pageNumber}\" style=\"{maxW}\">");
+            sb.AppendLine($"<div class=\"page\" data-page=\"{pageNumber}\" style=\"{pageStyle}\">");
             sb.Append(pageTemplates.HeaderForPage(pageNumber));
-            sb.Append("<div class=\"page-body\">");
-            sb.Append(pageList[i]);
+            sb.Append($"<div class=\"page-body\"{colBodyStyle}>");
+            sb.Append(pgContent);
             // Place footnotes on the page that contains the footnote reference
-            if (!string.IsNullOrEmpty(footnotesHtml) && pageList[i].Contains("fn-ref"))
+            if (!string.IsNullOrEmpty(footnotesHtml) && pgContent.Contains("fn-ref"))
                 sb.Append(footnotesHtml);
             // Place endnotes on the last page
             if (i == pageList.Count - 1 && !string.IsNullOrEmpty(endnotesHtml))
@@ -213,7 +282,10 @@ public partial class WordHandler
             sb.Append("</div>");
             var footerTemplate = pageTemplates.FooterForPage(pageNumber);
             if (!string.IsNullOrEmpty(footerTemplate))
-                sb.Append(PopulateFooterPageFields(footerTemplate, pageNumber, pageList.Count));
+                sb.Append(PopulateFooterPageFields(
+                    footerTemplate,
+                    OfficeCli.Core.WordNumFmtRenderer.Render(displayedPageNum, displayedFmt),
+                    pageList.Count.ToString()));
             sb.AppendLine("</div>");
             sb.AppendLine("</div>");
         }
@@ -548,12 +620,12 @@ public partial class WordHandler
             });
     }
 
-    private static string PopulateFooterPageFields(string footerHtml, int pageNumber, int pageCount)
+    private static string PopulateFooterPageFields(string footerHtml, string pageNumber, string pageCount)
     {
         if (string.IsNullOrEmpty(footerHtml)) return string.Empty;
         return footerHtml
-            .Replace("<!--PAGE_NUM-->", pageNumber.ToString())
-            .Replace("<!--PAGE_COUNT-->", pageCount.ToString());
+            .Replace("<!--PAGE_NUM-->", pageNumber)
+            .Replace("<!--PAGE_COUNT-->", pageCount);
     }
 
     private static string NormalizeStandalonePageBreakParagraphs(string bodyContent)
@@ -578,10 +650,10 @@ public partial class WordHandler
     {
         var sb = new StringBuilder();
         var cssClass = isHeader ? "doc-header" : "doc-footer";
-        var paragraphs = isHeader
-            ? ResolveHeaderPart(sectPr, requestedType)?.Header?.Elements<Paragraph>().ToList()
-            : ResolveFooterPart(sectPr, requestedType)?.Footer?.Elements<Paragraph>().ToList();
-        if (!HasRenderableHeaderFooterContent(paragraphs))
+        OpenXmlElement? headerFooter = isHeader
+            ? ResolveHeaderPart(sectPr, requestedType)?.Header
+            : ResolveFooterPart(sectPr, requestedType)?.Footer;
+        if (headerFooter == null || !HeaderFooterHasContent(headerFooter))
             return string.Empty;
 
         var previousRenderingHeaderFooter = _ctx.RenderingHeaderFooter;
@@ -590,11 +662,7 @@ public partial class WordHandler
         try
         {
             sb.AppendLine($"<div class=\"{cssClass}\">");
-            foreach (var para in paragraphs!)
-            {
-                _ctx.ResetHeaderFooterFieldState();
-                RenderParagraphHtml(sb, para);
-            }
+            RenderHeaderFooterBody(sb, headerFooter);
             sb.AppendLine("</div>");
         }
         finally
@@ -721,23 +789,51 @@ public partial class WordHandler
     {
         if (_ctx?.CachedPageLayout != null) return _ctx.CachedPageLayout;
         var sectPr = GetPreviewSectionProperties();
+        var result = GetPageLayoutFor(sectPr);
+        if (_ctx != null) _ctx.CachedPageLayout = result;
+        return result;
+    }
+
+    private static PageLayout GetPageLayoutFor(SectionProperties? sectPr)
+    {
         var pgSz = sectPr?.GetFirstChild<PageSize>();
         var pgMar = sectPr?.GetFirstChild<PageMargin>();
         const double c = 2.54 / 1440.0; // twips → cm
         const double p = 1.0 / 20.0;    // twips → pt (exact)
         var wTwips = (double)(pgSz?.Width?.Value ?? 11906);
         var hTwips = (double)(pgSz?.Height?.Value ?? 16838);
+        // Landscape: OOXML orient=landscape flips the width/height semantics.
+        // w:w/w:h already reflect the orientation in most real-world docs,
+        // but guard against the rare case where w:w < w:h but orient=landscape.
+        if (pgSz?.Orient?.Value == PageOrientationValues.Landscape && wTwips < hTwips)
+            (wTwips, hTwips) = (hTwips, wTwips);
         var tTwips = (double)(pgMar?.Top?.Value ?? 1440);
         var bTwips = (double)(pgMar?.Bottom?.Value ?? 1440);
         var lTwips = (double)(pgMar?.Left?.Value ?? 1440u);
         var rTwips = (double)(pgMar?.Right?.Value ?? 1440u);
         var hdTwips = (double)(pgMar?.Header?.Value ?? 851u);
         var fdTwips = (double)(pgMar?.Footer?.Value ?? 992u);
-        var result = new PageLayout(
+        return new PageLayout(
             wTwips * c, hTwips * c, tTwips * c, bTwips * c, lTwips * c, rTwips * c, hdTwips * c, fdTwips * c,
             wTwips * p, hTwips * p, tTwips * p, bTwips * p, lTwips * p, rTwips * p, hdTwips * p, fdTwips * p);
-        if (_ctx != null) _ctx.CachedPageLayout = result;
-        return result;
+    }
+
+    /// <summary>
+    /// Collect sectPrs in document order. Each paragraph's inline sectPr
+    /// (held in its pPr) terminates a section; the body's trailing sectPr
+    /// owns everything after the last inline one.
+    /// </summary>
+    private List<SectionProperties> CollectSections(Body body)
+    {
+        var list = new List<SectionProperties>();
+        foreach (var p in body.Elements<Paragraph>())
+        {
+            var inline = p.ParagraphProperties?.GetFirstChild<SectionProperties>();
+            if (inline != null) list.Add(inline);
+        }
+        var trailing = body.GetFirstChild<SectionProperties>();
+        if (trailing != null) list.Add(trailing);
+        return list;
     }
 
     private record DocDef(string Font, double SizePt, double LineHeight, string Color, double GridLinePitchPt,
@@ -786,7 +882,7 @@ public partial class WordHandler
             if (nsp?.Line?.Value is string nlv && int.TryParse(nlv, out var nlvi) && nsp.LineRule?.InnerText is "auto" or null)
                 lineH = nlvi / 240.0;
         }
-        if (lineH == 0) lineH = 1.0; // Word default single-line spacing
+        if (lineH == 0) lineH = 1.0; // OOXML default single-line spacing
 
         // docGrid linePitch — controls CJK snap-to-grid line spacing (twips → pt)
         double gridLinePitchPt = 0;
@@ -862,12 +958,8 @@ public partial class WordHandler
         if (!string.IsNullOrEmpty(majFont)) fonts.Add(majFont);
         var minFont = theme?.MinorFont?.LatinFont?.Typeface?.Value;
         if (!string.IsNullOrEmpty(minFont)) fonts.Add(minFont);
-        // Remove generic/system fonts that won't be on Google Fonts
-        fonts.RemoveWhere(f => f.StartsWith("Symbol") || f.StartsWith("Wingding")
-            || f.Equals("Arial", StringComparison.OrdinalIgnoreCase)
-            || f.Equals("Times New Roman", StringComparison.OrdinalIgnoreCase)
-            || f.Equals("Tahoma", StringComparison.OrdinalIgnoreCase)
-            || f.Equals("Courier New", StringComparison.OrdinalIgnoreCase));
+        // Remove fonts that have no usable @font-face (symbols, wingdings)
+        fonts.RemoveWhere(f => f.StartsWith("Symbol") || f.StartsWith("Wingding"));
         return fonts;
     }
 
@@ -948,9 +1040,9 @@ public partial class WordHandler
         var sb = new StringBuilder();
         foreach (var font in docFonts)
         {
-            var (ascPct, descPct) = FontMetricsReader.GetAscentDescentOverride(font);
-            var overrides = (ascPct > 0 && descPct > 0)
-                ? $" ascent-override: {ascPct:0.##}%; descent-override: {descPct:0.##}%; line-gap-override: 0%;"
+            var (ascentPct, descentPct) = FontMetricsReader.GetAscentDescentOverride(font);
+            var overrides = (ascentPct > 0 && descentPct > 0)
+                ? $" ascent-override: {ascentPct:0.##}%; descent-override: {descentPct:0.##}%; line-gap-override: 0%;"
                 : "";
             sb.AppendLine($"@font-face {{ font-family: '{font}'; src: local('{font}');{overrides} }}");
             sb.AppendLine($"@font-face {{ font-family: '{font}'; font-weight: bold; src: local('{font} Bold');{overrides} }}");
@@ -1017,6 +1109,80 @@ public partial class WordHandler
         sb.Append(RenderHeaderFooterHtml(isHeader, GetPreviewSectionProperties(), HeaderFooterValues.Default));
     }
 
+    /// <summary>Returns true if the header/footer has any visible content:
+    /// text, table, image/drawing, or field.</summary>
+    private static bool HeaderFooterHasContent(OpenXmlElement hf)
+    {
+        foreach (var child in hf.ChildElements)
+        {
+            if (child is Table) return true;
+            if (child is Paragraph p)
+            {
+                if (!string.IsNullOrWhiteSpace(p.InnerText)) return true;
+                if (p.Descendants<Drawing>().Any()) return true;
+                if (p.Descendants<FieldChar>().Any() || p.Descendants<SimpleField>().Any()) return true;
+                // VML watermark (<v:pict>) is visible content even though
+                // it carries no plain text and no DrawingML Drawing element.
+                if (p.Descendants<Picture>().Any()) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Iterate header/footer children in order, rendering paragraphs
+    /// and tables. Previously only paragraphs were emitted, dropping layout
+    /// tables and image-only paragraphs.</summary>
+    private void RenderHeaderFooterBody(StringBuilder sb, OpenXmlElement hf)
+    {
+        foreach (var child in hf.ChildElements)
+        {
+            if (child is Paragraph para)
+            {
+                _ctx.ResetHeaderFooterFieldState();
+                // Legacy VML watermark: a <v:shape> in a <w:pict> with
+                // a <v:textpath> child carrying the watermark string
+                // (DRAFT / CONFIDENTIAL / …). DrawingML text boxes are
+                // already handled by the shape renderer; VML is a
+                // parallel deprecated format we must detect by name.
+                var watermarkText = ExtractVmlWatermarkText(para);
+                if (watermarkText != null)
+                {
+                    sb.Append($"<span class=\"vml-watermark\" style=\"position:absolute;" +
+                              "top:50%;left:50%;transform:translate(-50%,-50%) rotate(-45deg);" +
+                              "color:#d0d0d0;font-size:7em;font-weight:bold;" +
+                              "z-index:0;pointer-events:none;white-space:nowrap;" +
+                              "user-select:none\">");
+                    sb.Append(HtmlEncode(watermarkText));
+                    sb.Append("</span>");
+                    continue;
+                }
+                RenderParagraphHtml(sb, para);
+            }
+            else if (child is Table tbl)
+                RenderTableHtml(sb, tbl);
+        }
+    }
+
+    /// <summary>
+    /// Return the watermark text from a legacy VML <c>w:pict &gt; v:shape &gt;
+    /// v:textpath</c> structure, or null if the paragraph does not carry one.
+    /// </summary>
+    private static string? ExtractVmlWatermarkText(Paragraph para)
+    {
+        foreach (var pict in para.Descendants<Picture>())
+        {
+            var shape = pict.Descendants().FirstOrDefault(e => e.LocalName == "shape"
+                && e.NamespaceUri == "urn:schemas-microsoft-com:vml");
+            if (shape == null) continue;
+            var textPath = shape.Descendants().FirstOrDefault(e => e.LocalName == "textpath"
+                && e.NamespaceUri == "urn:schemas-microsoft-com:vml");
+            if (textPath == null) continue;
+            var str = textPath.GetAttributes().FirstOrDefault(a => a.LocalName == "string").Value;
+            if (!string.IsNullOrWhiteSpace(str)) return str;
+        }
+        return null;
+    }
+
     // ==================== Body Rendering ====================
 
     private void RenderBodyHtml(StringBuilder sb, Body body)
@@ -1043,9 +1209,42 @@ public partial class WordHandler
         int wBlockCount = 0;
         bool inList = false;
         int pendingBlockClose = 0; // block number that needs <!--wE:N--> before next block starts
+
+        // Section tracking for per-section page layout (#7a00). The first
+        // section owns page 1; each inline sectPr ends its section and
+        // bumps the index so the next page can adopt the next section's
+        // width/height/margins.
+        int currentSectionIdx = 0;
+        sb.Append($"<!--SECT:{currentSectionIdx}-->");
+
+        // Drop cap wrapping (#7c): a framePr dropCap paragraph and the
+        // paragraph that follows must sit inside a non-flex container so
+        // `float:left` on the drop cap actually wraps the follow-on text.
+        // The parent page-body is a flex column which would otherwise
+        // stack them vertically. Counts down from 2 → 0.
+        int dropCapWrapRemaining = 0;
+
         for (int ei = 0; ei < elements.Count; ei++)
         {
             var element = elements[ei];
+
+            // #7c: close drop cap wrap once the follow-on paragraph has
+            // emitted. If we hit a non-paragraph (table, SectionProperties)
+            // before the follow-on, also close to keep HTML well-formed.
+            if (dropCapWrapRemaining > 0 && ei > 0)
+            {
+                var prev = elements[ei - 1];
+                if (prev is Paragraph)
+                {
+                    dropCapWrapRemaining--;
+                    if (dropCapWrapRemaining == 0) sb.Append("</div>");
+                }
+                else if (prev is Table)
+                {
+                    sb.Append("</div>");
+                    dropCapWrapRemaining = 0;
+                }
+            }
 
             // MOD(#5): Handle body-level comment range markers
             if (element is CommentRangeStart bodyCrs)
@@ -1068,8 +1267,7 @@ public partial class WordHandler
             }
 
             if (element is Paragraph manualPageBreakPara
-                && string.IsNullOrWhiteSpace(GetParagraphText(manualPageBreakPara))
-                && manualPageBreakPara.OuterXml.Contains("w:br w:type=\"page\"", StringComparison.Ordinal))
+                && IsStandalonePageBreakParagraph(manualPageBreakPara))
             {
                 sb.Append("<!--PAGE_BREAK-->");
                 continue;
@@ -1122,6 +1320,10 @@ public partial class WordHandler
                 {
                     sb.Append("<!--PAGE_BREAK-->");
                 }
+                // Advance section index whether or not a page break fires,
+                // so the continuous-section layout still updates.
+                currentSectionIdx++;
+                sb.Append($"<!--SECT:{currentSectionIdx}-->");
 
                 var nextCols = GetNextSectionColumnCount(elements, ei, bodyColCount);
                 if (nextCols > 1 && !inMultiColumn)
@@ -1138,6 +1340,20 @@ public partial class WordHandler
 
             if (element is Paragraph para)
             {
+                // Drop cap wrapping (#7c): open non-flex wrapper on the
+                // dropCap paragraph; close after the paragraph that follows.
+                // Skip wrapping when para is a list item, heading, or empty —
+                // Word's drop cap only applies to body paragraphs.
+                var paraFramePr = para.ParagraphProperties?.GetFirstChild<FrameProperties>();
+                var paraIsDropCap = paraFramePr != null &&
+                    paraFramePr.GetAttributes().FirstOrDefault(a => a.LocalName == "dropCap").Value
+                        is "drop" or "margin";
+                if (paraIsDropCap && dropCapWrapRemaining == 0)
+                {
+                    sb.Append("<div class=\"dropcap-wrap\" style=\"display:block;overflow:hidden\">");
+                    dropCapWrapRemaining = 2;
+                }
+
                 // Check for pageBreakBefore (direct or from style) — insert page break marker
                 var pgBB = para.ParagraphProperties?.PageBreakBefore;
                 if (pgBB == null)
@@ -1218,15 +1434,6 @@ public partial class WordHandler
                         pendingLiClose = false;
                     }
 
-                    // Build <ol>/<ul> attributes: type, start, indentation
-                    var olType = numFmt switch
-                    {
-                        "lowerLetter" => " type=\"a\"",
-                        "upperLetter" => " type=\"A\"",
-                        "lowerRoman" => " type=\"i\"",
-                        "upperRoman" => " type=\"I\"",
-                        _ => ""
-                    };
                     // Get indentation from numbering level definition
                     var (lvlLeft, lvlHanging) = GetListLevelIndentFull(numId, ilvl);
                     var parentLeft = ilvl > 0 ? GetListLevelIndent(numId, ilvl - 1) : 0;
@@ -1244,7 +1451,12 @@ public partial class WordHandler
                     if (indentPt < 18) indentPt = 18; // minimum indent
                     var hangingPt = lvlHanging / 20.0;
                     var listStyleParts = $"padding-left:{indentPt:0.#}pt;margin:0";
-                    if (isMultiLevel) listStyleParts += ";list-style-type:none";
+                    // CONSISTENCY(list-marker): every ordered list is rendered with
+                    // list-style-type:none and a computed marker <span>. This lets
+                    // WordNumFmtRenderer handle numFmt variants (chineseCounting,
+                    // decimalZero, …) plus lvlText/suff/lvlJc that CSS `<ol type>`
+                    // cannot express. See KNOWN_ISSUES.md #4.
+                    if (tag == "ol") listStyleParts += ";list-style-type:none";
                     if (picBulletUri != null)
                         listStyleParts += $";list-style-image:url('{picBulletUri}')";
                     else if (tag == "ul")
@@ -1261,43 +1473,42 @@ public partial class WordHandler
                     }
                     var indentStyle = $" style=\"{listStyleParts}\"";
 
+                    // Seed per-level counter from startOverride / level start
+                    // when we're opening this level for the first time in the
+                    // current list. Cross-list (different numId) continuation is
+                    // preserved via olCountPerLevel survival.
+                    int SeedStart(int forIlvl)
+                    {
+                        if (olCountPerLevel.TryGetValue(forIlvl, out var prev) && prev > 0)
+                            return prev; // continuation
+                        return (GetStartValue(numId, forIlvl) ?? 1) - 1;
+                    }
+
                     while (listStack.Count < ilvl + 1)
                     {
-                        if (tag == "ol")
-                        {
-                            var startAttr = "";
-                            if (olCountPerLevel.TryGetValue(ilvl, out var prevCount) && prevCount > 0)
-                                startAttr = $" start=\"{prevCount + 1}\"";
-                            sb.AppendLine($"<{tag}{olType}{startAttr}{indentStyle}>");
-                        }
-                        else
-                            sb.AppendLine($"<{tag}{indentStyle}>");
+                        sb.AppendLine($"<{tag}{indentStyle}>");
                         listStack.Push(tag);
                     }
                     // If same level but different list type, swap
                     if (listStack.Count > 0 && listStack.Peek() != tag)
                     {
                         sb.AppendLine($"</{listStack.Pop()}>");
-                        if (tag == "ol")
-                        {
-                            var startAttr = "";
-                            if (olCountPerLevel.TryGetValue(ilvl, out var pc) && pc > 0)
-                                startAttr = $" start=\"{pc + 1}\"";
-                            sb.AppendLine($"<{tag}{olType}{startAttr}{indentStyle}>");
-                        }
-                        else
-                            sb.AppendLine($"<{tag}{indentStyle}>");
+                        sb.AppendLine($"<{tag}{indentStyle}>");
                         listStack.Push(tag);
                     }
 
                     // Track counters
                     if (tag == "ol")
                     {
-                        olCountPerLevel[ilvl] = olCountPerLevel.GetValueOrDefault(ilvl, 0) + 1;
-                        multiLevelCounters[ilvl] = multiLevelCounters.GetValueOrDefault(ilvl, 0) + 1;
+                        var seed = SeedStart(ilvl);
+                        olCountPerLevel[ilvl] = olCountPerLevel.GetValueOrDefault(ilvl, seed) + 1;
+                        multiLevelCounters[ilvl] = olCountPerLevel[ilvl];
                         // Reset deeper level counters
                         for (int lk = ilvl + 1; lk <= 8; lk++)
+                        {
+                            if (olCountPerLevel.ContainsKey(lk)) olCountPerLevel[lk] = 0;
                             if (multiLevelCounters.ContainsKey(lk)) multiLevelCounters[lk] = 0;
+                        }
                     }
 
                     currentListType = listStyle;
@@ -1309,14 +1520,28 @@ public partial class WordHandler
                     if (!string.IsNullOrEmpty(paraStyle))
                         sb.Append($" style=\"{paraStyle}\"");
                     sb.Append(">");
-                    // Multi-level numbering: prepend computed number (e.g., "1.1.1.")
-                    if (isMultiLevel && tag == "ol" && lvlText != null)
+                    // Computed marker for every ordered-list item (single or multi-level).
+                    if (tag == "ol")
                     {
-                        var numStr = lvlText;
-                        for (int lk = 0; lk <= ilvl; lk++)
-                            numStr = numStr.Replace($"%{lk + 1}", multiLevelCounters.GetValueOrDefault(lk, 0).ToString());
-                        var numWidth = hangingPt > 0 ? $"{hangingPt:0.#}pt" : "3em";
-                        sb.Append($"<span style=\"display:inline-block;min-width:{numWidth};padding-right:0.5em\">{numStr}</span>");
+                        var template = string.IsNullOrEmpty(lvlText) ? $"%{ilvl + 1}" : lvlText!;
+                        var marker = System.Text.RegularExpressions.Regex.Replace(template, @"%(\d)", m =>
+                        {
+                            var k = int.Parse(m.Groups[1].Value) - 1;
+                            var lvlFmt = GetNumberingFormat(numId, k);
+                            var counter = multiLevelCounters.GetValueOrDefault(k, 0);
+                            return OfficeCli.Core.WordNumFmtRenderer.Render(counter, lvlFmt);
+                        });
+                        var suff = GetLevelSuffix(numId, ilvl);
+                        var jc = GetLevelJustification(numId, ilvl);
+                        var markerWidth = hangingPt > 0 ? $"{hangingPt:0.#}pt" : "3em";
+                        var markerPadding = suff switch
+                        {
+                            "nothing" => "0",
+                            "space" => "0.25em",
+                            _ => "0.5em" // tab
+                        };
+                        var align = jc switch { "right" => "right", "center" => "center", _ => "left" };
+                        sb.Append($"<span style=\"display:inline-block;min-width:{markerWidth};padding-right:{markerPadding};text-align:{align}\">{HtmlEncode(marker)}</span>");
                     }
                     RenderParagraphContentHtml(sb, para);
                     pendingLiClose = true; // defer </li> in case next item nests
@@ -1358,7 +1583,11 @@ public partial class WordHandler
                     // carries a numPr, expand the level's lvlText ("%1.%2")
                     // against the running heading counters and prepend the
                     // result as a <span class="heading-num">.
-                    var hNumPr = ResolveNumPrFromStyle(para);
+                    //
+                    // An explicit `<w:numPr><w:numId w:val="0"/></w:numPr>` on
+                    // the paragraph suppresses this heading's number without
+                    // disturbing the sibling counter (Word: …2→3→unnumbered→4).
+                    var hNumPr = IsNumberingSuppressed(para) ? null : ResolveNumPrFromStyle(para);
                     if (hNumPr is { } hn)
                     {
                         headingCounters[hn.Ilvl] = headingCounters.GetValueOrDefault(hn.Ilvl, 0) + 1;
@@ -1369,11 +1598,13 @@ public partial class WordHandler
                         var lvlText = GetLevelText(hn.NumId, hn.Ilvl);
                         if (!string.IsNullOrEmpty(lvlText))
                         {
-                            var numStr = lvlText;
-                            for (int lk = 0; lk <= hn.Ilvl; lk++)
-                                numStr = numStr.Replace(
-                                    $"%{lk + 1}",
-                                    headingCounters.GetValueOrDefault(lk, 0).ToString());
+                            var numStr = System.Text.RegularExpressions.Regex.Replace(lvlText, @"%(\d)", m =>
+                            {
+                                var lk = int.Parse(m.Groups[1].Value) - 1;
+                                var lvlFmt = GetNumberingFormat(hn.NumId, lk);
+                                var counter = headingCounters.GetValueOrDefault(lk, 0);
+                                return OfficeCli.Core.WordNumFmtRenderer.Render(counter, lvlFmt);
+                            });
                             // Skip the auto-num span when the paragraph text
                             // already begins with the computed number, so a
                             // user-typed "1. Overview" does not render as
@@ -1451,13 +1682,79 @@ public partial class WordHandler
                 CloseAllLists(sb, listStack, ref currentListType, ref pendingLiClose);
                 RenderTableHtml(sb, table, dataPath: $"/body/table[{wTableCount}]");
             }
+            else if (element is AltChunk altChunk)
+            {
+                CloseAllLists(sb, listStack, ref currentListType, ref pendingLiClose);
+                RenderAltChunkHtml(sb, altChunk);
+            }
         }
 
         // Close any pending block (last element was non-list with continue, or last list block)
         if (pendingBlockClose > 0) sb.Append($"<span class=\"we\" data-block=\"{pendingBlockClose}\" style=\"display:none\"></span>");
         if (inList) sb.Append($"<span class=\"we\" data-block=\"{wBlockCount}\" style=\"display:none\"></span>");
         if (inMultiColumn) sb.AppendLine("</div>");
+        if (dropCapWrapRemaining > 0) sb.Append("</div>");
         CloseAllLists(sb, listStack, ref currentListType, ref pendingLiClose);
+    }
+
+    /// <summary>
+    /// #8b: emit the alternate content referenced by a <c>&lt;w:altChunk&gt;</c>
+    /// relationship. text/html is injected (with <c>&lt;script&gt;</c> tags
+    /// stripped); text/plain is wrapped in <c>&lt;pre&gt;</c>; RTF and
+    /// other binary-ish formats fall back to a stripped-text placeholder.
+    /// Opens the door to rendering HTML fragments authors embed in Word
+    /// via "Insert File → HTML" instead of rendering a blank gap.
+    /// </summary>
+    private void RenderAltChunkHtml(StringBuilder sb, AltChunk altChunk)
+    {
+        var rId = altChunk.Id?.Value;
+        if (string.IsNullOrEmpty(rId)) return;
+        try
+        {
+            var part = _doc.MainDocumentPart?.GetPartById(rId)
+                       as AlternativeFormatImportPart;
+            if (part == null) return;
+            using var stream = part.GetStream();
+            using var reader = new StreamReader(stream);
+            var content = reader.ReadToEnd();
+            var contentType = (part.ContentType ?? "").ToLowerInvariant();
+
+            if (contentType is "text/html" or "application/xhtml+xml")
+            {
+                var bodyMatch = Regex.Match(content,
+                    @"<body[^>]*>(.*?)</body>",
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
+                var inner = bodyMatch.Success ? bodyMatch.Groups[1].Value : content;
+                inner = Regex.Replace(inner,
+                    @"<script[^>]*>.*?</script>",
+                    "",
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
+                inner = Regex.Replace(inner,
+                    @"<(?:link|meta|iframe|object|embed)[^>]*>",
+                    "",
+                    RegexOptions.IgnoreCase);
+                sb.AppendLine($"<div class=\"alt-chunk-html\">{inner}</div>");
+            }
+            else if (contentType is "text/plain" or "text/css")
+            {
+                sb.AppendLine($"<pre class=\"alt-chunk-text\">{HtmlEncode(content)}</pre>");
+            }
+            else
+            {
+                // RTF etc.: strip control words and braces, emit as plain-text block.
+                var plain = Regex.Replace(content, @"\\[a-zA-Z]+-?\d*\s?|[{}]", " ");
+                plain = Regex.Replace(plain, @"\s+", " ").Trim();
+                if (plain.Length > 1000) plain = plain[..1000] + "…";
+                sb.AppendLine(
+                    $"<div class=\"alt-chunk-fallback\" " +
+                    $"style=\"border:1px dashed #bbb;padding:4px;font-style:italic;color:#555\">" +
+                    $"{HtmlEncode(plain)}</div>");
+            }
+        }
+        catch
+        {
+            // Silent skip: altChunk part missing / unreadable shouldn't break the whole preview.
+        }
     }
 
     private static void CloseAllLists(StringBuilder sb, Stack<string> listStack, ref string? currentListType, ref bool pendingLiClose)
@@ -1496,17 +1793,7 @@ public partial class WordHandler
     /// <summary>Get the left indent and hanging indent (in twips) for a numbering level definition.</summary>
     private (int left, int hanging) GetListLevelIndentFull(int numId, int ilvl)
     {
-        var numPart = _doc.MainDocumentPart?.NumberingDefinitionsPart;
-        if (numPart == null) return (0, 0);
-        var numbering = numPart.Numbering;
-        var numInst = numbering?.Elements<NumberingInstance>()
-            .FirstOrDefault(n => n.NumberID?.Value == numId);
-        var absId = numInst?.AbstractNumId?.Val?.Value;
-        if (absId == null) return (0, 0);
-        var absDef = numbering?.Elements<AbstractNum>()
-            .FirstOrDefault(a => a.AbstractNumberId?.Value == absId);
-        var lvl = absDef?.Elements<Level>()
-            .FirstOrDefault(l => l.LevelIndex?.Value == ilvl);
+        var lvl = GetLevel(numId, ilvl);
         var indent = lvl?.PreviousParagraphProperties?.Indentation;
         int left = 0, hanging = 0;
         if (indent?.Left?.Value is string ls && int.TryParse(ls, out var lt))

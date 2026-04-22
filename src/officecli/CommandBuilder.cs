@@ -1087,6 +1087,8 @@ static partial class CommandBuilder
     /// </summary>
     private static void NotifyWatch(IDocumentHandler handler, string filePath, string? changedPath)
     {
+        if (!WatchServer.IsWatching(filePath)) return;
+
         if (handler is OfficeCli.Handlers.ExcelHandler excel)
         {
             string? scrollTo = null;
@@ -1124,6 +1126,8 @@ static partial class CommandBuilder
 
     private static void NotifyWatchRoot(IDocumentHandler handler, string filePath, int oldSlideCount)
     {
+        if (!WatchServer.IsWatching(filePath)) return;
+
         if (handler is OfficeCli.Handlers.ExcelHandler excel)
         {
             WatchNotifier.NotifyIfWatching(filePath, new WatchMessage { Action = "full", FullHtml = excel.ViewAsHtml() });

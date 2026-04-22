@@ -78,16 +78,43 @@ public partial class WordHandler
             }
         }
 
-        // Table width: explicit tblW, or 100% of page content area
+        // Table width: explicit tblW → use it; pct → percentage; otherwise sum gridCol widths
         var tblW = tblPr?.TableWidth;
-        if (tblW?.Type?.InnerText == "dxa" && int.TryParse(tblW.Width?.Value, out var twW) && twW > 0)
+        var tblWType = tblW?.Type?.InnerText;
+        if (tblWType == "dxa" && int.TryParse(tblW!.Width?.Value, out var twW) && twW > 0)
         {
             tableStyles.Add($"width:{twW / 20.0:0.##}pt");
         }
+        else if (tblWType == "pct" && int.TryParse(tblW!.Width?.Value, out var pctW) && pctW > 0)
+        {
+            // pct values are in 1/50th of a percent (5000 = 100%)
+            tableStyles.Add($"width:{pctW / 50.0:0.##}%");
+        }
         else
         {
-            // Default: fill available page width (Word auto-fit behavior)
-            tableStyles.Add("width:100%");
+            // No explicit tblW or type=auto: use gridCol sum as max-width (Word auto-fit behavior)
+            // auto layout tables in Word shrink to content; max-width lets browser do the same
+            var isFixed = tblPr?.TableLayout?.Type?.InnerText == "fixed";
+            var grid = table.GetFirstChild<TableGrid>();
+            var gridCols = grid?.Elements<GridColumn>().ToList();
+            if (gridCols != null && gridCols.Count > 0)
+            {
+                int totalTwips = 0;
+                bool allValid = true;
+                foreach (var gc in gridCols)
+                {
+                    if (gc.Width?.Value is string gw && int.TryParse(gw, out var gwVal))
+                        totalTwips += gwVal;
+                    else
+                        allValid = false;
+                }
+                if (allValid && totalTwips > 0)
+                {
+                    var prop = isFixed ? "width" : "max-width";
+                    tableStyles.Add($"{prop}:{totalTwips / 20.0:0.##}pt");
+                }
+            }
+            // else: no grid info — browser auto-fits to content
         }
 
         var tableClass = tableBordersNone ? "borderless" : "";
@@ -273,26 +300,43 @@ public partial class WordHandler
         NoVBand = 0x0400,
     }
 
-    /// <summary>Parse tblLook from table properties. Supports both val hex bitmask and individual attributes.</summary>
+    /// <summary>Parse tblLook from table properties. Individual attributes
+    /// (firstRow/firstColumn/…) take precedence over the legacy val hex
+    /// bitmask — spec §17.7.6.7 marks val as deprecated.</summary>
     private static TableLookFlags ParseTableLook(TableProperties? tblPr)
     {
         var tblLook = tblPr?.GetFirstChild<TableLook>();
         if (tblLook == null) return TableLookFlags.None;
 
-        // Try val attribute (hex bitmask)
+        // If ANY individual boolean attr is set (true OR false), use them
+        // exclusively — a firstColumn="0" authored to turn OFF conditional
+        // formatting must win over a legacy Val bitmask that would set it.
+        var hasIndividualAttrs =
+            tblLook.FirstRow != null ||
+            tblLook.LastRow != null ||
+            tblLook.FirstColumn != null ||
+            tblLook.LastColumn != null ||
+            tblLook.NoHorizontalBand != null ||
+            tblLook.NoVerticalBand != null;
+
+        if (hasIndividualAttrs)
+        {
+            var flags = TableLookFlags.None;
+            if (tblLook.FirstRow?.Value == true) flags |= TableLookFlags.FirstRow;
+            if (tblLook.LastRow?.Value == true) flags |= TableLookFlags.LastRow;
+            if (tblLook.FirstColumn?.Value == true) flags |= TableLookFlags.FirstColumn;
+            if (tblLook.LastColumn?.Value == true) flags |= TableLookFlags.LastColumn;
+            if (tblLook.NoHorizontalBand?.Value == true) flags |= TableLookFlags.NoHBand;
+            if (tblLook.NoVerticalBand?.Value == true) flags |= TableLookFlags.NoVBand;
+            return flags;
+        }
+
+        // Fall back to val hex bitmask when no individual attrs are authored.
         var val = tblLook.Val?.Value;
         if (val != null && int.TryParse(val, System.Globalization.NumberStyles.HexNumber, null, out var hex))
             return (TableLookFlags)hex;
 
-        // Fall back to individual boolean attributes
-        var flags = TableLookFlags.None;
-        if (tblLook.FirstRow?.Value == true) flags |= TableLookFlags.FirstRow;
-        if (tblLook.LastRow?.Value == true) flags |= TableLookFlags.LastRow;
-        if (tblLook.FirstColumn?.Value == true) flags |= TableLookFlags.FirstColumn;
-        if (tblLook.LastColumn?.Value == true) flags |= TableLookFlags.LastColumn;
-        if (tblLook.NoHorizontalBand?.Value == true) flags |= TableLookFlags.NoHBand;
-        if (tblLook.NoVerticalBand?.Value == true) flags |= TableLookFlags.NoVBand;
-        return flags;
+        return TableLookFlags.None;
     }
 
     /// <summary>Cached conditional format data from a table style.</summary>
