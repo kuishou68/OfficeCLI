@@ -795,7 +795,10 @@ public partial class PowerPointHandler
         {
             var rtpAttr = zmPr.GetAttribute("returnToParent", "");
             if (!string.IsNullOrEmpty(rtpAttr.Value))
-                node.Format["returnToParent"] = rtpAttr.Value;
+            {
+                // Schema declares bool; normalize "1"/"0"/"true"/"false" → bool.
+                node.Format["returnToParent"] = rtpAttr.Value is "1" or "true";
+            }
             var tdAttr = zmPr.GetAttribute("transitionDur", "");
             if (!string.IsNullOrEmpty(tdAttr.Value))
                 node.Format["transitionDur"] = tdAttr.Value;
