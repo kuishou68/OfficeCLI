@@ -269,6 +269,22 @@
   - 仅影响 `view ... html` 预览层，不影响 DOCX 写回
   - 依赖“iframe 中保持原始页宽”的宿主会看到行为变化；这类宿主需要显式设置关闭开关
 
+### 14. PPT HTML 预览跳过母版/版式结构占位符
+
+- **What**：修改 `PowerPointHandler.HtmlPreview.cs` 的 `RenderInheritedShapes`：从 SlideLayout / SlideMaster 继承渲染 shape 时，只允许 `date/footer/header/slide number` 这类元信息 placeholder 作为可见占位符输出；`title/body/subtitle/object` 以及未显式写 `type` 的 placeholder 一律视为结构占位符跳过
+- **Why**：
+  - 上游原逻辑只跳过显式 `title/body/subtitle/object`，但真实 PPTX 中 layout content placeholder 常只有 `idx/sz`，没有 `type`
+  - OOXML/PowerPoint 语义里这类 placeholder 是给幻灯片内容继承样式和位置的结构槽位，不是要在最终预览中显示的真实文本
+  - 旧 HTML renderer 会把母版提示文案（例如 `单击此处编辑母版文本样式` / `二级三级四级五级`）渲染成普通 `.shape`，覆盖幻灯片实际标题和正文
+- **Solves**：
+  - Cove 预览 `Cove + OfficeAI 演示用例20260407/产品资料/OfficeAI 产品介绍 1110.pptx` 时，slide 4/6/9/15 不再出现母版提示文字叠在实际内容上
+  - 修复点位于 OfficeCLI renderer，Cove 适配层无需再通过 HTML 文案过滤脚本兜底
+- **Location**：`src/officecli/Handlers/Pptx/PowerPointHandler.HtmlPreview.cs`
+- **Added**：2026-04-27，branch `feat/tracked-changes`，commit `pending`
+- **Risk**：
+  - 影响 `view ... html` PPT/PPTX 预览层，不影响 PPTX 写回
+  - 如果某个文档故意把 layout/master 的内容 placeholder 当作可见文本使用，预览会不再显示这类非标准内容；常规页脚、日期、页码、页眉 placeholder 仍保留
+
 ---
 
 ## 流程
